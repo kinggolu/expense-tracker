@@ -1,4 +1,2 @@
-"""Subpackage containing all of pip's command line interface related code
+"""A package that contains models that represent entities.
 """
-
-# This file intentionally does not import submodules
