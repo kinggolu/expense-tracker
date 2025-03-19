@@ -1,15 +1,31 @@
-# This file is dual licensed under the terms of the Apache License, Version
-# 2.0, and the BSD License. See the LICENSE file in the root of this repository
-# for complete details.
+"""Wrappers to call pyproject.toml-based build backend hooks.
+"""
 
-__title__ = "packaging"
-__summary__ = "Core utilities for Python packages"
-__uri__ = "https://github.com/pypa/packaging"
+from typing import TYPE_CHECKING
 
-__version__ = "24.2"
+from ._impl import (
+    BackendUnavailable,
+    BuildBackendHookCaller,
+    HookMissing,
+    UnsupportedOperation,
+    default_subprocess_runner,
+    quiet_subprocess_runner,
+)
 
-__author__ = "Donald Stufft and individual contributors"
-__email__ = "donald@stufft.io"
+__version__ = "1.2.0"
+__all__ = [
+    "BackendUnavailable",
+    "BackendInvalid",
+    "HookMissing",
+    "UnsupportedOperation",
+    "default_subprocess_runner",
+    "quiet_subprocess_runner",
+    "BuildBackendHookCaller",
+]
 
-__license__ = "BSD-2-Clause or Apache-2.0"
-__copyright__ = f"2014 {__author__}"
+BackendInvalid = BackendUnavailable  # Deprecated alias, previously a separate exception
+
+if TYPE_CHECKING:
+    from ._impl import SubprocessRunner
+
+    __all__ += ["SubprocessRunner"]
