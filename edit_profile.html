@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Expensify | Edit Profile</title>
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <h3>Expensify <i class="fas fa-wallet ms-2"></i></h3>
+            </div>
+            <ul class="sidebar-menu">
+                <li><a href="{{ url_for('index') }}"><i class="fas fa-home me-2"></i> Dashboard</a></li>
+                <li><a href="#"><i class="fas fa-chart-pie me-2"></i> Analytics</a></li>
+                <li class="active"><a href="{{ url_for('profile') }}"><i class="fas fa-user me-2"></i> Profile</a></li>
+                <li><a href="{{ url_for('settings') }}"><i class="fas fa-cog me-2"></i> Settings</a></li>
+            </ul>
+            <div class="sidebar-footer">
+                <p>© 2023 Expensify</p>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <div class="main-content">
+            <!-- Top Navigation -->
+            <div class="top-nav">
+                <div class="container-fluid">
+                    <div class="row align-items-center">
+                        <div class="col">
+                            <h2 class="page-title text-center">Edit Profile <i class="fas fa-user-edit ms-2"></i></h2>
+                        </div>
+                        <div class="col-auto d-flex align-items-center">
+                            <!-- Theme Toggle -->
+                            <div class="theme-toggle me-4">
+                                <button id="themeToggle" class="btn btn-sm">
+                                    <i class="fas fa-sun theme-icon-light"></i>
+                                    <i class="fas fa-moon theme-icon-dark"></i>
+                                </button>
+                            </div>
+                            <div class="user-profile">
+                                <span class="user-greeting">Welcome, {{ session.username }}!</span>
+                                <div class="user-avatar dropdown">
+                                    <a href="#" class="dropdown-toggle" id="userDropdown" data-bs-toggle="dropdown" aria-expanded="false">
+                                        <i class="fas fa-user"></i>
+                                    </a>
+                                    <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="userDropdown">
+                                        <li><a class="dropdown-item" href="{{ url_for('profile') }}"><i class="fas fa-user-circle me-2"></i>Profile</a></li>
+                                        <li><a class="dropdown-item" href="{{ url_for('settings') }}"><i class="fas fa-cog me-2"></i>Settings</a></li>
+                                        <li><hr class="dropdown-divider"></li>
+                                        <li><a class="dropdown-item" href="{{ url_for('logout') }}"><i class="fas fa-sign-out-alt me-2"></i>Logout</a></li>
+                                    </ul>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Edit Profile Content -->
+            <div class="dashboard-content">
+                <div class="container-fluid">
+                    <div class="row justify-content-center">
+                        <div class="col-lg-8">
+                            <div class="content-card">
+                                <div class="card-header">
+                                    <h3><i class="fas fa-user-edit me-2"></i> Edit Your Profile</h3>
+                                </div>
+                                <div class="card-body">
+                                    {% if error %}
+                                    <div class="alert alert-danger" role="alert">
+                                        <i class="fas fa-exclamation-circle me-2"></i> {{ error }}
+                                    </div>
+                                    {% endif %}
+                                    
+                                    {% if success %}
+                                    <div class="alert alert-success" role="alert">
+                                        <i class="fas fa-check-circle me-2"></i> {{ success }}
+                                    </div>
+                                    {% endif %}
+                                    
+                                    <form method="post" action="{{ url_for('edit_profile') }}">
+                                        <div class="mb-3">
+                                            <label for="username" class="form-label">Username</label>
+                                            <input type="text" class="form-control" id="username" name="username" value="{{ user.username|default('') }}" required>
+                                        </div>
+                                        <div class="mb-3">
+                                            <label for="email" class="form-label">Email</label>
+                                            <input type="email" class="form-control" id="email" name="email" value="{{ user.email|default('') }}" required>
+                                        </div>
+                                        
+                                        <hr class="my-4">
+                                        <h4 class="mb-3">Change Password</h4>
+                                        
+                                        <div class="mb-3">
+                                            <label for="currentPassword" class="form-label">Current Password</label>
+                                            <input type="password" class="form-control" id="currentPassword" name="current_password" required>
+                                            <div class="form-text">Required to save changes</div>
+                                        </div>
+                                        <div class="mb-3">
+                                            <label for="newPassword" class="form-label">New Password</label>
+                                            <input type="password" class="form-control" id="newPassword" name="new_password">
+                                            <div class="form-text">Leave blank to keep current password</div>
+                                        </div>
+                                        <div class="mb-3">
+                                            <label for="confirmPassword" class="form-label">Confirm New Password</label>
+                                            <input type="password" class="form-control" id="confirmPassword" name="confirm_password">
+                                        </div>
+                                        
+                                        <div class="d-flex justify-content-between mt-4">
+                                            <a href="{{ url_for('profile') }}" class="btn btn-outline-secondary">
+                                                <i class="fas fa-arrow-left me-2"></i> Back to Profile
+                                            </a>
+                                            <button type="submit" class="btn btn-primary">
+                                                <i class="fas fa-save me-2"></i> Save Changes
+                                            </button>
+                                        </div>
+                                    </form>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bootstrap Bundle with Popper -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Theme toggle functionality
+        document.addEventListener('DOMContentLoaded', function() {
+            // Initialize theme
+            const savedTheme = localStorage.getItem('theme');
+            if (savedTheme) {
+                document.documentElement.setAttribute('data-theme', savedTheme);
+            } else {
+                const prefersDarkMode = window.matchMedia('(prefers-color-scheme: dark)').matches;
+                const theme = prefersDarkMode ? 'dark' : 'light';
+                document.documentElement.setAttribute('data-theme', theme);
+                localStorage.setItem('theme', theme);
+            }
+            
+            // Theme toggle button
+            document.getElementById('themeToggle').addEventListener('click', function() {
+                const currentTheme = document.documentElement.getAttribute('data-theme');
+                const newTheme = currentTheme === 'light' ? 'dark' : 'light';
+                
+                document.documentElement.setAttribute('data-theme', newTheme);
+                localStorage.setItem('theme', newTheme);
+            });
+        });
+    </script>
+</body>
+</html> 

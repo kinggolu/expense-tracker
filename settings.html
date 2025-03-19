@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Expensify | Settings</title>
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <h3>Expensify <i class="fas fa-wallet ms-2"></i></h3>
+            </div>
+            <ul class="sidebar-menu">
+                <li><a href="{{ url_for('index') }}"><i class="fas fa-home me-2"></i> Dashboard</a></li>
+                <li><a href="#"><i class="fas fa-chart-pie me-2"></i> Analytics</a></li>
+                <li><a href="{{ url_for('profile') }}"><i class="fas fa-user me-2"></i> Profile</a></li>
+                <li class="active"><a href="{{ url_for('settings') }}"><i class="fas fa-cog me-2"></i> Settings</a></li>
+            </ul>
+            <div class="sidebar-footer">
+                <p>© 2023 Expensify</p>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <div class="main-content">
+            <!-- Top Navigation -->
+            <div class="top-nav">
+                <div class="container-fluid">
+                    <div class="row align-items-center">
+                        <div class="col">
+                            <h2 class="page-title text-center">Settings <i class="fas fa-cog ms-2"></i></h2>
+                        </div>
+                        <div class="col-auto d-flex align-items-center">
+                            <!-- Theme Toggle -->
+                            <div class="theme-toggle me-4">
+                                <button id="themeToggle" class="btn btn-sm">
+                                    <i class="fas fa-sun theme-icon-light"></i>
+                                    <i class="fas fa-moon theme-icon-dark"></i>
+                                </button>
+                            </div>
+                            <div class="user-profile">
+                                <span class="user-greeting">Welcome, {{ session.username }}!</span>
+                                <div class="user-avatar dropdown">
+                                    <a href="#" class="dropdown-toggle" id="userDropdown" data-bs-toggle="dropdown" aria-expanded="false">
+                                        <i class="fas fa-user"></i>
+                                    </a>
+                                    <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="userDropdown">
+                                        <li><a class="dropdown-item" href="{{ url_for('profile') }}"><i class="fas fa-user-circle me-2"></i>Profile</a></li>
+                                        <li><a class="dropdown-item" href="{{ url_for('settings') }}"><i class="fas fa-cog me-2"></i>Settings</a></li>
+                                        <li><hr class="dropdown-divider"></li>
+                                        <li><a class="dropdown-item" href="{{ url_for('logout') }}"><i class="fas fa-sign-out-alt me-2"></i>Logout</a></li>
+                                    </ul>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Settings Content -->
+            <div class="dashboard-content">
+                <div class="container-fluid">
+                    <div class="row">
+                        <!-- Appearance Settings -->
+                        <div class="col-lg-6">
+                            <div class="content-card">
+                                <div class="card-header">
+                                    <h3><i class="fas fa-palette me-2"></i> Appearance</h3>
+                                </div>
+                                <div class="card-body">
+                                    <div class="setting-item">
+                                        <div class="setting-label">
+                                            <h4>Theme</h4>
+                                            <p class="text-muted">Choose your preferred theme</p>
+                                        </div>
+                                        <div class="setting-control">
+                                            <div class="theme-selector">
+                                                <button class="theme-option light-theme" data-theme="light">
+                                                    <i class="fas fa-sun"></i>
+                                                    <span>Light</span>
+                                                </button>
+                                                <button class="theme-option dark-theme" data-theme="dark">
+                                                    <i class="fas fa-moon"></i>
+                                                    <span>Dark</span>
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    
+                                    <div class="setting-item">
+                                        <div class="setting-label">
+                                            <h4>Chart Colors</h4>
+                                            <p class="text-muted">Customize chart color scheme</p>
+                                        </div>
+                                        <div class="setting-control">
+                                            <select class="form-select" id="chartColorScheme">
+                                                <option value="default">Default</option>
+                                                <option value="pastel">Pastel</option>
+                                                <option value="vibrant">Vibrant</option>
+                                                <option value="monochrome">Monochrome</option>
+                                            </select>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Preferences Settings -->
+                        <div class="col-lg-6">
+                            <div class="content-card">
+                                <div class="card-header">
+                                    <h3><i class="fas fa-sliders-h me-2"></i> Preferences</h3>
+                                </div>
+                                <div class="card-body">
+                                    <div class="setting-item">
+                                        <div class="setting-label">
+                                            <h4>Currency</h4>
+                                            <p class="text-muted">Set your preferred currency</p>
+                                        </div>
+                                        <div class="setting-control">
+                                            <select class="form-select" id="currencyPreference">
+                                                <option value="₹">Indian Rupee (₹)</option>
+                                                <option value="$">US Dollar ($)</option>
+                                                <option value="€">Euro (€)</option>
+                                                <option value="£">British Pound (£)</option>
+                                                <option value="¥">Japanese Yen (¥)</option>
+                                            </select>
+                                        </div>
+                                    </div>
+                                    
+                                    <div class="setting-item">
+                                        <div class="setting-label">
+                                            <h4>Date Format</h4>
+                                            <p class="text-muted">Choose how dates are displayed</p>
+                                        </div>
+                                        <div class="setting-control">
+                                            <select class="form-select" id="dateFormat">
+                                                <option value="MM/DD/YYYY">MM/DD/YYYY</option>
+                                                <option value="DD/MM/YYYY">DD/MM/YYYY</option>
+                                                <option value="YYYY-MM-DD">YYYY-MM-DD</option>
+                                            </select>
+                                        </div>
+                                    </div>
+                                    
+                                    <div class="setting-item">
+                                        <div class="setting-label">
+                                            <h4>Notifications</h4>
+                                            <p class="text-muted">Enable or disable notifications</p>
+                                        </div>
+                                        <div class="setting-control">
+                                            <div class="form-check form-switch">
+                                                <input class="form-check-input" type="checkbox" id="notificationsToggle" checked>
+                                                <label class="form-check-label" for="notificationsToggle">Enable Notifications</label>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Data Management -->
+                        <div class="col-lg-12 mt-4">
+                            <div class="content-card">
+                                <div class="card-header">
+                                    <h3><i class="fas fa-database me-2"></i> Data Management</h3>
+                                </div>
+                                <div class="card-body">
+                                    <div class="row">
+                                        <div class="col-md-6">
+                                            <div class="data-action-card">
+                                                <div class="data-action-icon">
+                                                    <i class="fas fa-file-export"></i>
+                                                </div>
+                                                <div class="data-action-content">
+                                                    <h4>Export Data</h4>
+                                                    <p>Download your expense data as CSV or Excel file</p>
+                                                    <button class="btn btn-outline-primary mt-2">
+                                                        <i class="fas fa-download me-2"></i> Export
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div class="col-md-6">
+                                            <div class="data-action-card">
+                                                <div class="data-action-icon danger">
+                                                    <i class="fas fa-trash-alt"></i>
+                                                </div>
+                                                <div class="data-action-content">
+                                                    <h4>Clear Data</h4>
+                                                    <p>Delete all your expense records (cannot be undone)</p>
+                                                    <button class="btn btn-outline-danger mt-2">
+                                                        <i class="fas fa-trash-alt me-2"></i> Clear All Data
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bootstrap Bundle with Popper -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Theme toggle functionality
+        document.addEventListener('DOMContentLoaded', function() {
+            // Initialize theme
+            const savedTheme = localStorage.getItem('theme');
+            if (savedTheme) {
+                document.documentElement.setAttribute('data-theme', savedTheme);
+                highlightActiveTheme(savedTheme);
+            } else {
+                const prefersDarkMode = window.matchMedia('(prefers-color-scheme: dark)').matches;
+                const theme = prefersDarkMode ? 'dark' : 'light';
+                document.documentElement.setAttribute('data-theme', theme);
+                localStorage.setItem('theme', theme);
+                highlightActiveTheme(theme);
+            }
+            
+            // Theme toggle button
+            document.getElementById('themeToggle').addEventListener('click', function() {
+                const currentTheme = document.documentElement.getAttribute('data-theme');
+                const newTheme = currentTheme === 'light' ? 'dark' : 'light';
+                
+                document.documentElement.setAttribute('data-theme', newTheme);
+                localStorage.setItem('theme', newTheme);
+                highlightActiveTheme(newTheme);
+            });
+            
+            // Theme selector buttons
+            document.querySelectorAll('.theme-option').forEach(button => {
+                button.addEventListener('click', function() {
+                    const theme = this.getAttribute('data-theme');
+                    document.documentElement.setAttribute('data-theme', theme);
+                    localStorage.setItem('theme', theme);
+                    highlightActiveTheme(theme);
+                });
+            });
+            
+            // Highlight active theme
+            function highlightActiveTheme(theme) {
+                document.querySelectorAll('.theme-option').forEach(button => {
+                    if (button.getAttribute('data-theme') === theme) {
+                        button.classList.add('active');
+                    } else {
+                        button.classList.remove('active');
+                    }
+                });
+            }
+            
+            // Initialize chart color scheme
+            const savedColorScheme = localStorage.getItem('chartColorScheme') || 'default';
+            document.getElementById('chartColorScheme').value = savedColorScheme;
+            
+            // Save chart color scheme
+            document.getElementById('chartColorScheme').addEventListener('change', function() {
+                localStorage.setItem('chartColorScheme', this.value);
+            });
+            
+            // Initialize currency preference
+            const savedCurrency = localStorage.getItem('currencyPreference') || '₹';
+            document.getElementById('currencyPreference').value = savedCurrency;
+            
+            // Save currency preference
+            document.getElementById('currencyPreference').addEventListener('change', function() {
+                localStorage.setItem('currencyPreference', this.value);
+            });
+            
+            // Initialize date format
+            const savedDateFormat = localStorage.getItem('dateFormat') || 'MM/DD/YYYY';
+            document.getElementById('dateFormat').value = savedDateFormat;
+            
+            // Save date format
+            document.getElementById('dateFormat').addEventListener('change', function() {
+                localStorage.setItem('dateFormat', this.value);
+            });
+            
+            // Initialize notifications toggle
+            const notificationsEnabled = localStorage.getItem('notificationsEnabled') !== 'false';
+            document.getElementById('notificationsToggle').checked = notificationsEnabled;
+            
+            // Save notifications toggle
+            document.getElementById('notificationsToggle').addEventListener('change', function() {
+                localStorage.setItem('notificationsEnabled', this.checked);
+            });
+        });
+    </script>
+</body>
+</html> 
