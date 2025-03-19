@@ -1,116 +1,133 @@
+"""When it comes to combining multiple controller or view functions
+(however you want to call them) you need a dispatcher. A simple way
+would be applying regular expression tests on the ``PATH_INFO`` and
+calling registered callback functions that return the value then.
+
+This module implements a much more powerful system than simple regular
+expression matching because it can also convert values in the URLs and
+build URLs.
+
+Here a simple example that creates a URL map for an application with
+two subdomains (www and kb) and some URL rules:
+
+.. code-block:: python
+
+    m = Map([
+        # Static URLs
+        Rule('/', endpoint='static/index'),
+        Rule('/about', endpoint='static/about'),
+        Rule('/help', endpoint='static/help'),
+        # Knowledge Base
+        Subdomain('kb', [
+            Rule('/', endpoint='kb/index'),
+            Rule('/browse/', endpoint='kb/browse'),
+            Rule('/browse/<int:id>/', endpoint='kb/browse'),
+            Rule('/browse/<int:id>/<int:page>', endpoint='kb/browse')
+        ])
+    ], default_subdomain='www')
+
+If the application doesn't use subdomains it's perfectly fine to not set
+the default subdomain and not use the `Subdomain` rule factory. The
+endpoint in the rules can be anything, for example import paths or
+unique identifiers. The WSGI application can use those endpoints to get the
+handler for that URL.  It doesn't have to be a string at all but it's
+recommended.
+
+Now it's possible to create a URL adapter for one of the subdomains and
+build URLs:
+
+.. code-block:: python
+
+    c = m.bind('example.com')
+
+    c.build("kb/browse", dict(id=42))
+    'http://kb.example.com/browse/42/'
+
+    c.build("kb/browse", dict())
+    'http://kb.example.com/browse/'
+
+    c.build("kb/browse", dict(id=42, page=3))
+    'http://kb.example.com/browse/42/3'
+
+    c.build("static/about")
+    '/about'
+
+    c.build("static/index", force_external=True)
+    'http://www.example.com/'
+
+    c = m.bind('example.com', subdomain='kb')
+
+    c.build("static/about")
+    'http://www.example.com/about'
+
+The first argument to bind is the server name *without* the subdomain.
+Per default it will assume that the script is mounted on the root, but
+often that's not the case so you can provide the real mount point as
+second argument:
+
+.. code-block:: python
+
+    c = m.bind('example.com', '/applications/example')
+
+The third argument can be the subdomain, if not given the default
+subdomain is used.  For more details about binding have a look at the
+documentation of the `MapAdapter`.
+
+And here is how you can match URLs:
+
+.. code-block:: python
+
+    c = m.bind('example.com')
+
+    c.match("/")
+    ('static/index', {})
+
+    c.match("/about")
+    ('static/about', {})
+
+    c = m.bind('example.com', '/', 'kb')
+
+    c.match("/")
+    ('kb/index', {})
+
+    c.match("/browse/42/23")
+    ('kb/browse', {'id': 42, 'page': 23})
+
+If matching fails you get a ``NotFound`` exception, if the rule thinks
+it's a good idea to redirect (for example because the URL was defined
+to have a slash at the end but the request was missing that slash) it
+will raise a ``RequestRedirect`` exception. Both are subclasses of
+``HTTPException`` so you can use those errors as responses in the
+application.
+
+If matching succeeded but the URL rule was incompatible to the given
+method (for example there were only rules for ``GET`` and ``HEAD`` but
+routing tried to match a ``POST`` request) a ``MethodNotAllowed``
+exception is raised.
 """
-pip._vendor is for vendoring dependencies of pip to prevent needing pip to
-depend on something external.
-
-Files inside of pip._vendor should be considered immutable and should only be
-updated to versions from upstream.
-"""
-from __future__ import absolute_import
-
-import glob
-import os.path
-import sys
-
-# Downstream redistributors which have debundled our dependencies should also
-# patch this value to be true. This will trigger the additional patching
-# to cause things like "six" to be available as pip.
-DEBUNDLED = False
-
-# By default, look in this directory for a bunch of .whl files which we will
-# add to the beginning of sys.path before attempting to import anything. This
-# is done to support downstream re-distributors like Debian and Fedora who
-# wish to create their own Wheels for our dependencies to aid in debundling.
-WHEEL_DIR = os.path.abspath(os.path.dirname(__file__))
-
-
-# Define a small helper function to alias our vendored modules to the real ones
-# if the vendored ones do not exist. This idea of this was taken from
-# https://github.com/kennethreitz/requests/pull/2567.
-def vendored(modulename):
-    vendored_name = "{0}.{1}".format(__name__, modulename)
-
-    try:
-        __import__(modulename, globals(), locals(), level=0)
-    except ImportError:
-        # We can just silently allow import failures to pass here. If we
-        # got to this point it means that ``import pip._vendor.whatever``
-        # failed and so did ``import whatever``. Since we're importing this
-        # upfront in an attempt to alias imports, not erroring here will
-        # just mean we get a regular import error whenever pip *actually*
-        # tries to import one of these modules to use it, which actually
-        # gives us a better error message than we would have otherwise
-        # gotten.
-        pass
-    else:
-        sys.modules[vendored_name] = sys.modules[modulename]
-        base, head = vendored_name.rsplit(".", 1)
-        setattr(sys.modules[base], head, sys.modules[modulename])
-
-
-# If we're operating in a debundled setup, then we want to go ahead and trigger
-# the aliasing of our vendored libraries as well as looking for wheels to add
-# to our sys.path. This will cause all of this code to be a no-op typically
-# however downstream redistributors can enable it in a consistent way across
-# all platforms.
-if DEBUNDLED:
-    # Actually look inside of WHEEL_DIR to find .whl files and add them to the
-    # front of our sys.path.
-    sys.path[:] = glob.glob(os.path.join(WHEEL_DIR, "*.whl")) + sys.path
-
-    # Actually alias all of our vendored dependencies.
-    vendored("cachecontrol")
-    vendored("certifi")
-    vendored("distlib")
-    vendored("distro")
-    vendored("packaging")
-    vendored("packaging.version")
-    vendored("packaging.specifiers")
-    vendored("pkg_resources")
-    vendored("platformdirs")
-    vendored("progress")
-    vendored("pyproject_hooks")
-    vendored("requests")
-    vendored("requests.exceptions")
-    vendored("requests.packages")
-    vendored("requests.packages.urllib3")
-    vendored("requests.packages.urllib3._collections")
-    vendored("requests.packages.urllib3.connection")
-    vendored("requests.packages.urllib3.connectionpool")
-    vendored("requests.packages.urllib3.contrib")
-    vendored("requests.packages.urllib3.contrib.ntlmpool")
-    vendored("requests.packages.urllib3.contrib.pyopenssl")
-    vendored("requests.packages.urllib3.exceptions")
-    vendored("requests.packages.urllib3.fields")
-    vendored("requests.packages.urllib3.filepost")
-    vendored("requests.packages.urllib3.packages")
-    vendored("requests.packages.urllib3.packages.ordered_dict")
-    vendored("requests.packages.urllib3.packages.six")
-    vendored("requests.packages.urllib3.packages.ssl_match_hostname")
-    vendored("requests.packages.urllib3.packages.ssl_match_hostname."
-             "_implementation")
-    vendored("requests.packages.urllib3.poolmanager")
-    vendored("requests.packages.urllib3.request")
-    vendored("requests.packages.urllib3.response")
-    vendored("requests.packages.urllib3.util")
-    vendored("requests.packages.urllib3.util.connection")
-    vendored("requests.packages.urllib3.util.request")
-    vendored("requests.packages.urllib3.util.response")
-    vendored("requests.packages.urllib3.util.retry")
-    vendored("requests.packages.urllib3.util.ssl_")
-    vendored("requests.packages.urllib3.util.timeout")
-    vendored("requests.packages.urllib3.util.url")
-    vendored("resolvelib")
-    vendored("rich")
-    vendored("rich.console")
-    vendored("rich.highlighter")
-    vendored("rich.logging")
-    vendored("rich.markup")
-    vendored("rich.progress")
-    vendored("rich.segment")
-    vendored("rich.style")
-    vendored("rich.text")
-    vendored("rich.traceback")
-    if sys.version_info < (3, 11):
-        vendored("tomli")
-    vendored("truststore")
-    vendored("urllib3")
+from .converters import AnyConverter as AnyConverter
+from .converters import BaseConverter as BaseConverter
+from .converters import FloatConverter as FloatConverter
+from .converters import IntegerConverter as IntegerConverter
+from .converters import PathConverter as PathConverter
+from .converters import UnicodeConverter as UnicodeConverter
+from .converters import UUIDConverter as UUIDConverter
+from .converters import ValidationError as ValidationError
+from .exceptions import BuildError as BuildError
+from .exceptions import NoMatch as NoMatch
+from .exceptions import RequestAliasRedirect as RequestAliasRedirect
+from .exceptions import RequestPath as RequestPath
+from .exceptions import RequestRedirect as RequestRedirect
+from .exceptions import RoutingException as RoutingException
+from .exceptions import WebsocketMismatch as WebsocketMismatch
+from .map import Map as Map
+from .map import MapAdapter as MapAdapter
+from .matcher import StateMachineMatcher as StateMachineMatcher
+from .rules import EndpointPrefix as EndpointPrefix
+from .rules import parse_converter_args as parse_converter_args
+from .rules import Rule as Rule
+from .rules import RuleFactory as RuleFactory
+from .rules import RuleTemplate as RuleTemplate
+from .rules import RuleTemplateFactory as RuleTemplateFactory
+from .rules import Subdomain as Subdomain
+from .rules import Submount as Submount

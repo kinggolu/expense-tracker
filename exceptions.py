@@ -1,323 +1,148 @@
-from __future__ import absolute_import
+from __future__ import annotations
 
-from .packages.six.moves.http_client import IncompleteRead as httplib_IncompleteRead
+import difflib
+import typing as t
 
-# Base Exceptions
+from ..exceptions import BadRequest
+from ..exceptions import HTTPException
+from ..utils import cached_property
+from ..utils import redirect
 
-
-class HTTPError(Exception):
-    """Base exception used by this module."""
-
-    pass
-
-
-class HTTPWarning(Warning):
-    """Base warning used by this module."""
-
-    pass
-
-
-class PoolError(HTTPError):
-    """Base exception for errors caused within a pool."""
-
-    def __init__(self, pool, message):
-        self.pool = pool
-        HTTPError.__init__(self, "%s: %s" % (pool, message))
-
-    def __reduce__(self):
-        # For pickling purposes.
-        return self.__class__, (None, None)
+if t.TYPE_CHECKING:
+    from _typeshed.wsgi import WSGIEnvironment
+    from .map import MapAdapter
+    from .rules import Rule
+    from ..wrappers.request import Request
+    from ..wrappers.response import Response
 
 
-class RequestError(PoolError):
-    """Base exception for PoolErrors that have associated URLs."""
+class RoutingException(Exception):
+    """Special exceptions that require the application to redirect, notifying
+    about missing urls, etc.
 
-    def __init__(self, pool, url, message):
-        self.url = url
-        PoolError.__init__(self, pool, message)
-
-    def __reduce__(self):
-        # For pickling purposes.
-        return self.__class__, (None, self.url, None)
-
-
-class SSLError(HTTPError):
-    """Raised when SSL certificate fails in an HTTPS connection."""
-
-    pass
-
-
-class ProxyError(HTTPError):
-    """Raised when the connection to a proxy fails."""
-
-    def __init__(self, message, error, *args):
-        super(ProxyError, self).__init__(message, error, *args)
-        self.original_error = error
-
-
-class DecodeError(HTTPError):
-    """Raised when automatic decoding based on Content-Type fails."""
-
-    pass
-
-
-class ProtocolError(HTTPError):
-    """Raised when something unexpected happens mid-request/response."""
-
-    pass
-
-
-#: Renamed to ProtocolError but aliased for backwards compatibility.
-ConnectionError = ProtocolError
-
-
-# Leaf Exceptions
-
-
-class MaxRetryError(RequestError):
-    """Raised when the maximum number of retries is exceeded.
-
-    :param pool: The connection pool
-    :type pool: :class:`~urllib3.connectionpool.HTTPConnectionPool`
-    :param string url: The requested Url
-    :param exceptions.Exception reason: The underlying error
-
+    :internal:
     """
 
-    def __init__(self, pool, url, reason=None):
-        self.reason = reason
 
-        message = "Max retries exceeded with url: %s (Caused by %r)" % (url, reason)
+class RequestRedirect(HTTPException, RoutingException):
+    """Raise if the map requests a redirect. This is for example the case if
+    `strict_slashes` are activated and an url that requires a trailing slash.
 
-        RequestError.__init__(self, pool, url, message)
-
-
-class HostChangedError(RequestError):
-    """Raised when an existing pool gets a request for a foreign host."""
-
-    def __init__(self, pool, url, retries=3):
-        message = "Tried to open a foreign host with url: %s" % url
-        RequestError.__init__(self, pool, url, message)
-        self.retries = retries
-
-
-class TimeoutStateError(HTTPError):
-    """Raised when passing an invalid state to a timeout"""
-
-    pass
-
-
-class TimeoutError(HTTPError):
-    """Raised when a socket timeout error occurs.
-
-    Catching this error will catch both :exc:`ReadTimeoutErrors
-    <ReadTimeoutError>` and :exc:`ConnectTimeoutErrors <ConnectTimeoutError>`.
+    The attribute `new_url` contains the absolute destination url.
     """
 
-    pass
+    code = 308
+
+    def __init__(self, new_url: str) -> None:
+        super().__init__(new_url)
+        self.new_url = new_url
+
+    def get_response(
+        self,
+        environ: WSGIEnvironment | Request | None = None,
+        scope: dict | None = None,
+    ) -> Response:
+        return redirect(self.new_url, self.code)
 
 
-class ReadTimeoutError(TimeoutError, RequestError):
-    """Raised when a socket timeout occurs while receiving data from a server"""
+class RequestPath(RoutingException):
+    """Internal exception."""
 
-    pass
+    __slots__ = ("path_info",)
 
-
-# This timeout error does not have a URL attached and needs to inherit from the
-# base HTTPError
-class ConnectTimeoutError(TimeoutError):
-    """Raised when a socket timeout occurs while connecting to a server"""
-
-    pass
+    def __init__(self, path_info: str) -> None:
+        super().__init__()
+        self.path_info = path_info
 
 
-class NewConnectionError(ConnectTimeoutError, PoolError):
-    """Raised when we fail to establish a new connection. Usually ECONNREFUSED."""
+class RequestAliasRedirect(RoutingException):  # noqa: B903
+    """This rule is an alias and wants to redirect to the canonical URL."""
 
-    pass
-
-
-class EmptyPoolError(PoolError):
-    """Raised when a pool runs out of connections and no more are allowed."""
-
-    pass
+    def __init__(self, matched_values: t.Mapping[str, t.Any], endpoint: str) -> None:
+        super().__init__()
+        self.matched_values = matched_values
+        self.endpoint = endpoint
 
 
-class ClosedPoolError(PoolError):
-    """Raised when a request enters a pool after the pool has been closed."""
-
-    pass
-
-
-class LocationValueError(ValueError, HTTPError):
-    """Raised when there is something wrong with a given URL input."""
-
-    pass
-
-
-class LocationParseError(LocationValueError):
-    """Raised when get_host or similar fails to parse the URL input."""
-
-    def __init__(self, location):
-        message = "Failed to parse: %s" % location
-        HTTPError.__init__(self, message)
-
-        self.location = location
-
-
-class URLSchemeUnknown(LocationValueError):
-    """Raised when a URL input has an unsupported scheme."""
-
-    def __init__(self, scheme):
-        message = "Not supported URL scheme %s" % scheme
-        super(URLSchemeUnknown, self).__init__(message)
-
-        self.scheme = scheme
-
-
-class ResponseError(HTTPError):
-    """Used as a container for an error reason supplied in a MaxRetryError."""
-
-    GENERIC_ERROR = "too many error responses"
-    SPECIFIC_ERROR = "too many {status_code} error responses"
-
-
-class SecurityWarning(HTTPWarning):
-    """Warned when performing security reducing actions"""
-
-    pass
-
-
-class SubjectAltNameWarning(SecurityWarning):
-    """Warned when connecting to a host with a certificate missing a SAN."""
-
-    pass
-
-
-class InsecureRequestWarning(SecurityWarning):
-    """Warned when making an unverified HTTPS request."""
-
-    pass
-
-
-class SystemTimeWarning(SecurityWarning):
-    """Warned when system time is suspected to be wrong"""
-
-    pass
-
-
-class InsecurePlatformWarning(SecurityWarning):
-    """Warned when certain TLS/SSL configuration is not available on a platform."""
-
-    pass
-
-
-class SNIMissingWarning(HTTPWarning):
-    """Warned when making a HTTPS request without SNI available."""
-
-    pass
-
-
-class DependencyWarning(HTTPWarning):
-    """
-    Warned when an attempt is made to import a module with missing optional
-    dependencies.
+class BuildError(RoutingException, LookupError):
+    """Raised if the build system cannot find a URL for an endpoint with the
+    values provided.
     """
 
-    pass
+    def __init__(
+        self,
+        endpoint: str,
+        values: t.Mapping[str, t.Any],
+        method: str | None,
+        adapter: MapAdapter | None = None,
+    ) -> None:
+        super().__init__(endpoint, values, method)
+        self.endpoint = endpoint
+        self.values = values
+        self.method = method
+        self.adapter = adapter
 
+    @cached_property
+    def suggested(self) -> Rule | None:
+        return self.closest_rule(self.adapter)
 
-class ResponseNotChunked(ProtocolError, ValueError):
-    """Response needs to be chunked in order to read it as chunks."""
-
-    pass
-
-
-class BodyNotHttplibCompatible(HTTPError):
-    """
-    Body should be :class:`http.client.HTTPResponse` like
-    (have an fp attribute which returns raw chunks) for read_chunked().
-    """
-
-    pass
-
-
-class IncompleteRead(HTTPError, httplib_IncompleteRead):
-    """
-    Response length doesn't match expected Content-Length
-
-    Subclass of :class:`http.client.IncompleteRead` to allow int value
-    for ``partial`` to avoid creating large objects on streamed reads.
-    """
-
-    def __init__(self, partial, expected):
-        super(IncompleteRead, self).__init__(partial, expected)
-
-    def __repr__(self):
-        return "IncompleteRead(%i bytes read, %i more expected)" % (
-            self.partial,
-            self.expected,
-        )
-
-
-class InvalidChunkLength(HTTPError, httplib_IncompleteRead):
-    """Invalid chunk length in a chunked response."""
-
-    def __init__(self, response, length):
-        super(InvalidChunkLength, self).__init__(
-            response.tell(), response.length_remaining
-        )
-        self.response = response
-        self.length = length
-
-    def __repr__(self):
-        return "InvalidChunkLength(got length %r, %i bytes read)" % (
-            self.length,
-            self.partial,
-        )
-
-
-class InvalidHeader(HTTPError):
-    """The header provided was somehow invalid."""
-
-    pass
-
-
-class ProxySchemeUnknown(AssertionError, URLSchemeUnknown):
-    """ProxyManager does not support the supplied scheme"""
-
-    # TODO(t-8ch): Stop inheriting from AssertionError in v2.0.
-
-    def __init__(self, scheme):
-        # 'localhost' is here because our URL parser parses
-        # localhost:8080 -> scheme=localhost, remove if we fix this.
-        if scheme == "localhost":
-            scheme = None
-        if scheme is None:
-            message = "Proxy URL had no scheme, should start with http:// or https://"
-        else:
-            message = (
-                "Proxy URL had unsupported scheme %s, should use http:// or https://"
-                % scheme
+    def closest_rule(self, adapter: MapAdapter | None) -> Rule | None:
+        def _score_rule(rule: Rule) -> float:
+            return sum(
+                [
+                    0.98
+                    * difflib.SequenceMatcher(
+                        None, rule.endpoint, self.endpoint
+                    ).ratio(),
+                    0.01 * bool(set(self.values or ()).issubset(rule.arguments)),
+                    0.01 * bool(rule.methods and self.method in rule.methods),
+                ]
             )
-        super(ProxySchemeUnknown, self).__init__(message)
+
+        if adapter and adapter.map._rules:
+            return max(adapter.map._rules, key=_score_rule)
+
+        return None
+
+    def __str__(self) -> str:
+        message = [f"Could not build url for endpoint {self.endpoint!r}"]
+        if self.method:
+            message.append(f" ({self.method!r})")
+        if self.values:
+            message.append(f" with values {sorted(self.values)!r}")
+        message.append(".")
+        if self.suggested:
+            if self.endpoint == self.suggested.endpoint:
+                if (
+                    self.method
+                    and self.suggested.methods is not None
+                    and self.method not in self.suggested.methods
+                ):
+                    message.append(
+                        " Did you mean to use methods"
+                        f" {sorted(self.suggested.methods)!r}?"
+                    )
+                missing_values = self.suggested.arguments.union(
+                    set(self.suggested.defaults or ())
+                ) - set(self.values.keys())
+                if missing_values:
+                    message.append(
+                        f" Did you forget to specify values {sorted(missing_values)!r}?"
+                    )
+            else:
+                message.append(f" Did you mean {self.suggested.endpoint!r} instead?")
+        return "".join(message)
 
 
-class ProxySchemeUnsupported(ValueError):
-    """Fetching HTTPS resources through HTTPS proxies is unsupported"""
-
-    pass
-
-
-class HeaderParsingError(HTTPError):
-    """Raised by assert_header_parsing, but we convert it to a log.warning statement."""
-
-    def __init__(self, defects, unparsed_data):
-        message = "%s, unparsed data: %r" % (defects or "Unknown", unparsed_data)
-        super(HeaderParsingError, self).__init__(message)
+class WebsocketMismatch(BadRequest):
+    """The only matched rule is either a WebSocket and the request is
+    HTTP, or the rule is HTTP and the request is a WebSocket.
+    """
 
 
-class UnrewindableBodyError(HTTPError):
-    """urllib3 encountered an error when trying to rewind a body"""
+class NoMatch(Exception):
+    __slots__ = ("have_match_for", "websocket_mismatch")
 
-    pass
+    def __init__(self, have_match_for: set[str], websocket_mismatch: bool) -> None:
+        self.have_match_for = have_match_for
+        self.websocket_mismatch = websocket_mismatch
