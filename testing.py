@@ -1,479 +1,295 @@
-import contextlib
-import io
-import os
-import shlex
-import shutil
-import sys
-import tempfile
+from __future__ import annotations
+
+import importlib.metadata
 import typing as t
+from contextlib import contextmanager
+from contextlib import ExitStack
+from copy import copy
 from types import TracebackType
+from urllib.parse import urlsplit
 
-from . import formatting
-from . import termui
-from . import utils
-from ._compat import _find_binary_reader
+import werkzeug.test
+from click.testing import CliRunner
+from werkzeug.test import Client
+from werkzeug.wrappers import Request as BaseRequest
 
-if t.TYPE_CHECKING:
-    from .core import BaseCommand
+from .cli import ScriptInfo
+from .sessions import SessionMixin
 
+if t.TYPE_CHECKING:  # pragma: no cover
+    from werkzeug.test import TestResponse
 
-class EchoingStdin:
-    def __init__(self, input: t.BinaryIO, output: t.BinaryIO) -> None:
-        self._input = input
-        self._output = output
-        self._paused = False
-
-    def __getattr__(self, x: str) -> t.Any:
-        return getattr(self._input, x)
-
-    def _echo(self, rv: bytes) -> bytes:
-        if not self._paused:
-            self._output.write(rv)
-
-        return rv
-
-    def read(self, n: int = -1) -> bytes:
-        return self._echo(self._input.read(n))
-
-    def read1(self, n: int = -1) -> bytes:
-        return self._echo(self._input.read1(n))  # type: ignore
-
-    def readline(self, n: int = -1) -> bytes:
-        return self._echo(self._input.readline(n))
-
-    def readlines(self) -> t.List[bytes]:
-        return [self._echo(x) for x in self._input.readlines()]
-
-    def __iter__(self) -> t.Iterator[bytes]:
-        return iter(self._echo(x) for x in self._input)
-
-    def __repr__(self) -> str:
-        return repr(self._input)
+    from .app import Flask
 
 
-@contextlib.contextmanager
-def _pause_echo(stream: t.Optional[EchoingStdin]) -> t.Iterator[None]:
-    if stream is None:
-        yield
-    else:
-        stream._paused = True
-        yield
-        stream._paused = False
+class EnvironBuilder(werkzeug.test.EnvironBuilder):
+    """An :class:`~werkzeug.test.EnvironBuilder`, that takes defaults from the
+    application.
 
-
-class _NamedTextIOWrapper(io.TextIOWrapper):
-    def __init__(
-        self, buffer: t.BinaryIO, name: str, mode: str, **kwargs: t.Any
-    ) -> None:
-        super().__init__(buffer, **kwargs)
-        self._name = name
-        self._mode = mode
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    @property
-    def mode(self) -> str:
-        return self._mode
-
-
-def make_input_stream(
-    input: t.Optional[t.Union[str, bytes, t.IO[t.Any]]], charset: str
-) -> t.BinaryIO:
-    # Is already an input stream.
-    if hasattr(input, "read"):
-        rv = _find_binary_reader(t.cast(t.IO[t.Any], input))
-
-        if rv is not None:
-            return rv
-
-        raise TypeError("Could not find binary reader for input stream.")
-
-    if input is None:
-        input = b""
-    elif isinstance(input, str):
-        input = input.encode(charset)
-
-    return io.BytesIO(input)
-
-
-class Result:
-    """Holds the captured result of an invoked CLI script."""
-
-    def __init__(
-        self,
-        runner: "CliRunner",
-        stdout_bytes: bytes,
-        stderr_bytes: t.Optional[bytes],
-        return_value: t.Any,
-        exit_code: int,
-        exception: t.Optional[BaseException],
-        exc_info: t.Optional[
-            t.Tuple[t.Type[BaseException], BaseException, TracebackType]
-        ] = None,
-    ):
-        #: The runner that created the result
-        self.runner = runner
-        #: The standard output as bytes.
-        self.stdout_bytes = stdout_bytes
-        #: The standard error as bytes, or None if not available
-        self.stderr_bytes = stderr_bytes
-        #: The value returned from the invoked command.
-        #:
-        #: .. versionadded:: 8.0
-        self.return_value = return_value
-        #: The exit code as integer.
-        self.exit_code = exit_code
-        #: The exception that happened if one did.
-        self.exception = exception
-        #: The traceback
-        self.exc_info = exc_info
-
-    @property
-    def output(self) -> str:
-        """The (standard) output as unicode string."""
-        return self.stdout
-
-    @property
-    def stdout(self) -> str:
-        """The standard output as unicode string."""
-        return self.stdout_bytes.decode(self.runner.charset, "replace").replace(
-            "\r\n", "\n"
-        )
-
-    @property
-    def stderr(self) -> str:
-        """The standard error as unicode string."""
-        if self.stderr_bytes is None:
-            raise ValueError("stderr not separately captured")
-        return self.stderr_bytes.decode(self.runner.charset, "replace").replace(
-            "\r\n", "\n"
-        )
-
-    def __repr__(self) -> str:
-        exc_str = repr(self.exception) if self.exception else "okay"
-        return f"<{type(self).__name__} {exc_str}>"
-
-
-class CliRunner:
-    """The CLI runner provides functionality to invoke a Click command line
-    script for unittesting purposes in a isolated environment.  This only
-    works in single-threaded systems without any concurrency as it changes the
-    global interpreter state.
-
-    :param charset: the character set for the input and output data.
-    :param env: a dictionary with environment variables for overriding.
-    :param echo_stdin: if this is set to `True`, then reading from stdin writes
-                       to stdout.  This is useful for showing examples in
-                       some circumstances.  Note that regular prompts
-                       will automatically echo the input.
-    :param mix_stderr: if this is set to `False`, then stdout and stderr are
-                       preserved as independent streams.  This is useful for
-                       Unix-philosophy apps that have predictable stdout and
-                       noisy stderr, such that each may be measured
-                       independently
+    :param app: The Flask application to configure the environment from.
+    :param path: URL path being requested.
+    :param base_url: Base URL where the app is being served, which
+        ``path`` is relative to. If not given, built from
+        :data:`PREFERRED_URL_SCHEME`, ``subdomain``,
+        :data:`SERVER_NAME`, and :data:`APPLICATION_ROOT`.
+    :param subdomain: Subdomain name to append to :data:`SERVER_NAME`.
+    :param url_scheme: Scheme to use instead of
+        :data:`PREFERRED_URL_SCHEME`.
+    :param json: If given, this is serialized as JSON and passed as
+        ``data``. Also defaults ``content_type`` to
+        ``application/json``.
+    :param args: other positional arguments passed to
+        :class:`~werkzeug.test.EnvironBuilder`.
+    :param kwargs: other keyword arguments passed to
+        :class:`~werkzeug.test.EnvironBuilder`.
     """
 
     def __init__(
         self,
-        charset: str = "utf-8",
-        env: t.Optional[t.Mapping[str, t.Optional[str]]] = None,
-        echo_stdin: bool = False,
-        mix_stderr: bool = True,
+        app: Flask,
+        path: str = "/",
+        base_url: str | None = None,
+        subdomain: str | None = None,
+        url_scheme: str | None = None,
+        *args: t.Any,
+        **kwargs: t.Any,
     ) -> None:
-        self.charset = charset
-        self.env: t.Mapping[str, t.Optional[str]] = env or {}
-        self.echo_stdin = echo_stdin
-        self.mix_stderr = mix_stderr
+        assert not (base_url or subdomain or url_scheme) or (
+            base_url is not None
+        ) != bool(
+            subdomain or url_scheme
+        ), 'Cannot pass "subdomain" or "url_scheme" with "base_url".'
 
-    def get_default_prog_name(self, cli: "BaseCommand") -> str:
-        """Given a command object it will return the default program name
-        for it.  The default is the `name` attribute or ``"root"`` if not
-        set.
+        if base_url is None:
+            http_host = app.config.get("SERVER_NAME") or "localhost"
+            app_root = app.config["APPLICATION_ROOT"]
+
+            if subdomain:
+                http_host = f"{subdomain}.{http_host}"
+
+            if url_scheme is None:
+                url_scheme = app.config["PREFERRED_URL_SCHEME"]
+
+            url = urlsplit(path)
+            base_url = (
+                f"{url.scheme or url_scheme}://{url.netloc or http_host}"
+                f"/{app_root.lstrip('/')}"
+            )
+            path = url.path
+
+            if url.query:
+                sep = b"?" if isinstance(url.query, bytes) else "?"
+                path += sep + url.query
+
+        self.app = app
+        super().__init__(path, base_url, *args, **kwargs)
+
+    def json_dumps(self, obj: t.Any, **kwargs: t.Any) -> str:  # type: ignore
+        """Serialize ``obj`` to a JSON-formatted string.
+
+        The serialization will be configured according to the config associated
+        with this EnvironBuilder's ``app``.
         """
-        return cli.name or "root"
+        return self.app.json.dumps(obj, **kwargs)
 
-    def make_env(
-        self, overrides: t.Optional[t.Mapping[str, t.Optional[str]]] = None
-    ) -> t.Mapping[str, t.Optional[str]]:
-        """Returns the environment overrides for invoking a script."""
-        rv = dict(self.env)
-        if overrides:
-            rv.update(overrides)
-        return rv
 
-    @contextlib.contextmanager
-    def isolation(
-        self,
-        input: t.Optional[t.Union[str, bytes, t.IO[t.Any]]] = None,
-        env: t.Optional[t.Mapping[str, t.Optional[str]]] = None,
-        color: bool = False,
-    ) -> t.Iterator[t.Tuple[io.BytesIO, t.Optional[io.BytesIO]]]:
-        """A context manager that sets up the isolation for invoking of a
-        command line tool.  This sets up stdin with the given input data
-        and `os.environ` with the overrides from the given dictionary.
-        This also rebinds some internals in Click to be mocked (like the
-        prompt functionality).
+_werkzeug_version = ""
 
-        This is automatically done in the :meth:`invoke` method.
 
-        :param input: the input stream to put into sys.stdin.
-        :param env: the environment overrides as dictionary.
-        :param color: whether the output should contain color codes. The
-                      application can still override this explicitly.
+def _get_werkzeug_version() -> str:
+    global _werkzeug_version
 
-        .. versionchanged:: 8.0
-            ``stderr`` is opened with ``errors="backslashreplace"``
-            instead of the default ``"strict"``.
+    if not _werkzeug_version:
+        _werkzeug_version = importlib.metadata.version("werkzeug")
 
-        .. versionchanged:: 4.0
-            Added the ``color`` parameter.
+    return _werkzeug_version
+
+
+class FlaskClient(Client):
+    """Works like a regular Werkzeug test client but has knowledge about
+    Flask's contexts to defer the cleanup of the request context until
+    the end of a ``with`` block. For general information about how to
+    use this class refer to :class:`werkzeug.test.Client`.
+
+    .. versionchanged:: 0.12
+       `app.test_client()` includes preset default environment, which can be
+       set after instantiation of the `app.test_client()` object in
+       `client.environ_base`.
+
+    Basic usage is outlined in the :doc:`/testing` chapter.
+    """
+
+    application: Flask
+
+    def __init__(self, *args: t.Any, **kwargs: t.Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.preserve_context = False
+        self._new_contexts: list[t.ContextManager[t.Any]] = []
+        self._context_stack = ExitStack()
+        self.environ_base = {
+            "REMOTE_ADDR": "127.0.0.1",
+            "HTTP_USER_AGENT": f"Werkzeug/{_get_werkzeug_version()}",
+        }
+
+    @contextmanager
+    def session_transaction(
+        self, *args: t.Any, **kwargs: t.Any
+    ) -> t.Generator[SessionMixin, None, None]:
+        """When used in combination with a ``with`` statement this opens a
+        session transaction.  This can be used to modify the session that
+        the test client uses.  Once the ``with`` block is left the session is
+        stored back.
+
+        ::
+
+            with client.session_transaction() as session:
+                session['value'] = 42
+
+        Internally this is implemented by going through a temporary test
+        request context and since session handling could depend on
+        request variables this function accepts the same arguments as
+        :meth:`~flask.Flask.test_request_context` which are directly
+        passed through.
         """
-        bytes_input = make_input_stream(input, self.charset)
-        echo_input = None
-
-        old_stdin = sys.stdin
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        old_forced_width = formatting.FORCED_WIDTH
-        formatting.FORCED_WIDTH = 80
-
-        env = self.make_env(env)
-
-        bytes_output = io.BytesIO()
-
-        if self.echo_stdin:
-            bytes_input = echo_input = t.cast(
-                t.BinaryIO, EchoingStdin(bytes_input, bytes_output)
+        if self._cookies is None:
+            raise TypeError(
+                "Cookies are disabled. Create a client with 'use_cookies=True'."
             )
 
-        sys.stdin = text_input = _NamedTextIOWrapper(
-            bytes_input, encoding=self.charset, name="<stdin>", mode="r"
+        app = self.application
+        ctx = app.test_request_context(*args, **kwargs)
+        self._add_cookies_to_wsgi(ctx.request.environ)
+
+        with ctx:
+            sess = app.session_interface.open_session(app, ctx.request)
+
+        if sess is None:
+            raise RuntimeError("Session backend did not open a session.")
+
+        yield sess
+        resp = app.response_class()
+
+        if app.session_interface.is_null_session(sess):
+            return
+
+        with ctx:
+            app.session_interface.save_session(app, sess, resp)
+
+        self._update_cookies_from_response(
+            ctx.request.host.partition(":")[0],
+            ctx.request.path,
+            resp.headers.getlist("Set-Cookie"),
         )
 
-        if self.echo_stdin:
-            # Force unbuffered reads, otherwise TextIOWrapper reads a
-            # large chunk which is echoed early.
-            text_input._CHUNK_SIZE = 1  # type: ignore
+    def _copy_environ(self, other):
+        out = {**self.environ_base, **other}
 
-        sys.stdout = _NamedTextIOWrapper(
-            bytes_output, encoding=self.charset, name="<stdout>", mode="w"
-        )
+        if self.preserve_context:
+            out["werkzeug.debug.preserve_context"] = self._new_contexts.append
 
-        bytes_error = None
-        if self.mix_stderr:
-            sys.stderr = sys.stdout
+        return out
+
+    def _request_from_builder_args(self, args, kwargs):
+        kwargs["environ_base"] = self._copy_environ(kwargs.get("environ_base", {}))
+        builder = EnvironBuilder(self.application, *args, **kwargs)
+
+        try:
+            return builder.get_request()
+        finally:
+            builder.close()
+
+    def open(
+        self,
+        *args: t.Any,
+        buffered: bool = False,
+        follow_redirects: bool = False,
+        **kwargs: t.Any,
+    ) -> TestResponse:
+        if args and isinstance(
+            args[0], (werkzeug.test.EnvironBuilder, dict, BaseRequest)
+        ):
+            if isinstance(args[0], werkzeug.test.EnvironBuilder):
+                builder = copy(args[0])
+                builder.environ_base = self._copy_environ(builder.environ_base or {})
+                request = builder.get_request()
+            elif isinstance(args[0], dict):
+                request = EnvironBuilder.from_environ(
+                    args[0], app=self.application, environ_base=self._copy_environ({})
+                ).get_request()
+            else:
+                # isinstance(args[0], BaseRequest)
+                request = copy(args[0])
+                request.environ = self._copy_environ(request.environ)
         else:
-            bytes_error = io.BytesIO()
-            sys.stderr = _NamedTextIOWrapper(
-                bytes_error,
-                encoding=self.charset,
-                name="<stderr>",
-                mode="w",
-                errors="backslashreplace",
-            )
+            # request is None
+            request = self._request_from_builder_args(args, kwargs)
 
-        @_pause_echo(echo_input)  # type: ignore
-        def visible_input(prompt: t.Optional[str] = None) -> str:
-            sys.stdout.write(prompt or "")
-            val = text_input.readline().rstrip("\r\n")
-            sys.stdout.write(f"{val}\n")
-            sys.stdout.flush()
-            return val
+        # Pop any previously preserved contexts. This prevents contexts
+        # from being preserved across redirects or multiple requests
+        # within a single block.
+        self._context_stack.close()
 
-        @_pause_echo(echo_input)  # type: ignore
-        def hidden_input(prompt: t.Optional[str] = None) -> str:
-            sys.stdout.write(f"{prompt or ''}\n")
-            sys.stdout.flush()
-            return text_input.readline().rstrip("\r\n")
-
-        @_pause_echo(echo_input)  # type: ignore
-        def _getchar(echo: bool) -> str:
-            char = sys.stdin.read(1)
-
-            if echo:
-                sys.stdout.write(char)
-
-            sys.stdout.flush()
-            return char
-
-        default_color = color
-
-        def should_strip_ansi(
-            stream: t.Optional[t.IO[t.Any]] = None, color: t.Optional[bool] = None
-        ) -> bool:
-            if color is None:
-                return not default_color
-            return not color
-
-        old_visible_prompt_func = termui.visible_prompt_func
-        old_hidden_prompt_func = termui.hidden_prompt_func
-        old__getchar_func = termui._getchar
-        old_should_strip_ansi = utils.should_strip_ansi  # type: ignore
-        termui.visible_prompt_func = visible_input
-        termui.hidden_prompt_func = hidden_input
-        termui._getchar = _getchar
-        utils.should_strip_ansi = should_strip_ansi  # type: ignore
-
-        old_env = {}
-        try:
-            for key, value in env.items():
-                old_env[key] = os.environ.get(key)
-                if value is None:
-                    try:
-                        del os.environ[key]
-                    except Exception:
-                        pass
-                else:
-                    os.environ[key] = value
-            yield (bytes_output, bytes_error)
-        finally:
-            for key, value in old_env.items():
-                if value is None:
-                    try:
-                        del os.environ[key]
-                    except Exception:
-                        pass
-                else:
-                    os.environ[key] = value
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
-            sys.stdin = old_stdin
-            termui.visible_prompt_func = old_visible_prompt_func
-            termui.hidden_prompt_func = old_hidden_prompt_func
-            termui._getchar = old__getchar_func
-            utils.should_strip_ansi = old_should_strip_ansi  # type: ignore
-            formatting.FORCED_WIDTH = old_forced_width
-
-    def invoke(
-        self,
-        cli: "BaseCommand",
-        args: t.Optional[t.Union[str, t.Sequence[str]]] = None,
-        input: t.Optional[t.Union[str, bytes, t.IO[t.Any]]] = None,
-        env: t.Optional[t.Mapping[str, t.Optional[str]]] = None,
-        catch_exceptions: bool = True,
-        color: bool = False,
-        **extra: t.Any,
-    ) -> Result:
-        """Invokes a command in an isolated environment.  The arguments are
-        forwarded directly to the command line script, the `extra` keyword
-        arguments are passed to the :meth:`~clickpkg.Command.main` function of
-        the command.
-
-        This returns a :class:`Result` object.
-
-        :param cli: the command to invoke
-        :param args: the arguments to invoke. It may be given as an iterable
-                     or a string. When given as string it will be interpreted
-                     as a Unix shell command. More details at
-                     :func:`shlex.split`.
-        :param input: the input data for `sys.stdin`.
-        :param env: the environment overrides.
-        :param catch_exceptions: Whether to catch any other exceptions than
-                                 ``SystemExit``.
-        :param extra: the keyword arguments to pass to :meth:`main`.
-        :param color: whether the output should contain color codes. The
-                      application can still override this explicitly.
-
-        .. versionchanged:: 8.0
-            The result object has the ``return_value`` attribute with
-            the value returned from the invoked command.
-
-        .. versionchanged:: 4.0
-            Added the ``color`` parameter.
-
-        .. versionchanged:: 3.0
-            Added the ``catch_exceptions`` parameter.
-
-        .. versionchanged:: 3.0
-            The result object has the ``exc_info`` attribute with the
-            traceback if available.
-        """
-        exc_info = None
-        with self.isolation(input=input, env=env, color=color) as outstreams:
-            return_value = None
-            exception: t.Optional[BaseException] = None
-            exit_code = 0
-
-            if isinstance(args, str):
-                args = shlex.split(args)
-
-            try:
-                prog_name = extra.pop("prog_name")
-            except KeyError:
-                prog_name = self.get_default_prog_name(cli)
-
-            try:
-                return_value = cli.main(args=args or (), prog_name=prog_name, **extra)
-            except SystemExit as e:
-                exc_info = sys.exc_info()
-                e_code = t.cast(t.Optional[t.Union[int, t.Any]], e.code)
-
-                if e_code is None:
-                    e_code = 0
-
-                if e_code != 0:
-                    exception = e
-
-                if not isinstance(e_code, int):
-                    sys.stdout.write(str(e_code))
-                    sys.stdout.write("\n")
-                    e_code = 1
-
-                exit_code = e_code
-
-            except Exception as e:
-                if not catch_exceptions:
-                    raise
-                exception = e
-                exit_code = 1
-                exc_info = sys.exc_info()
-            finally:
-                sys.stdout.flush()
-                stdout = outstreams[0].getvalue()
-                if self.mix_stderr:
-                    stderr = None
-                else:
-                    stderr = outstreams[1].getvalue()  # type: ignore
-
-        return Result(
-            runner=self,
-            stdout_bytes=stdout,
-            stderr_bytes=stderr,
-            return_value=return_value,
-            exit_code=exit_code,
-            exception=exception,
-            exc_info=exc_info,  # type: ignore
+        response = super().open(
+            request,
+            buffered=buffered,
+            follow_redirects=follow_redirects,
         )
+        response.json_module = self.application.json  # type: ignore[assignment]
 
-    @contextlib.contextmanager
-    def isolated_filesystem(
-        self, temp_dir: t.Optional[t.Union[str, "os.PathLike[str]"]] = None
-    ) -> t.Iterator[str]:
-        """A context manager that creates a temporary directory and
-        changes the current working directory to it. This isolates tests
-        that affect the contents of the CWD to prevent them from
-        interfering with each other.
+        # Re-push contexts that were preserved during the request.
+        while self._new_contexts:
+            cm = self._new_contexts.pop()
+            self._context_stack.enter_context(cm)
 
-        :param temp_dir: Create the temporary directory under this
-            directory. If given, the created directory is not removed
-            when exiting.
+        return response
 
-        .. versionchanged:: 8.0
-            Added the ``temp_dir`` parameter.
+    def __enter__(self) -> FlaskClient:
+        if self.preserve_context:
+            raise RuntimeError("Cannot nest client invocations")
+        self.preserve_context = True
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type | None,
+        exc_value: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.preserve_context = False
+        self._context_stack.close()
+
+
+class FlaskCliRunner(CliRunner):
+    """A :class:`~click.testing.CliRunner` for testing a Flask app's
+    CLI commands. Typically created using
+    :meth:`~flask.Flask.test_cli_runner`. See :ref:`testing-cli`.
+    """
+
+    def __init__(self, app: Flask, **kwargs: t.Any) -> None:
+        self.app = app
+        super().__init__(**kwargs)
+
+    def invoke(  # type: ignore
+        self, cli: t.Any = None, args: t.Any = None, **kwargs: t.Any
+    ) -> t.Any:
+        """Invokes a CLI command in an isolated environment. See
+        :meth:`CliRunner.invoke <click.testing.CliRunner.invoke>` for
+        full method documentation. See :ref:`testing-cli` for examples.
+
+        If the ``obj`` argument is not given, passes an instance of
+        :class:`~flask.cli.ScriptInfo` that knows how to load the Flask
+        app being tested.
+
+        :param cli: Command object to invoke. Default is the app's
+            :attr:`~flask.app.Flask.cli` group.
+        :param args: List of strings to invoke the command with.
+
+        :return: a :class:`~click.testing.Result` object.
         """
-        cwd = os.getcwd()
-        dt = tempfile.mkdtemp(dir=temp_dir)
-        os.chdir(dt)
+        if cli is None:
+            cli = self.app.cli  # type: ignore
 
-        try:
-            yield dt
-        finally:
-            os.chdir(cwd)
+        if "obj" not in kwargs:
+            kwargs["obj"] = ScriptInfo(create_app=lambda: self.app)
 
-            if temp_dir is None:
-                try:
-                    shutil.rmtree(dt)
-                except OSError:  # noqa: B014
-                    pass
+        return super().invoke(cli, args, **kwargs)
