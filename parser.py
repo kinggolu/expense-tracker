@@ -1,529 +1,294 @@
-"""
-This module started out as largely a copy paste from the stdlib's
-optparse module with the features removed that we do not need from
-optparse because we implement them in Click on a higher level (for
-instance type handling, help formatting and a lot more).
+"""Base option parser setup"""
 
-The plan is to remove more and more from here over time.
+import logging
+import optparse
+import shutil
+import sys
+import textwrap
+from contextlib import suppress
+from typing import Any, Dict, Generator, List, NoReturn, Optional, Tuple
 
-The reason this is a different module and not optparse from the stdlib
-is that there are differences in 2.x and 3.x about the error messages
-generated and optparse in the stdlib uses gettext for no good reason
-and might cause us issues.
+from pip._internal.cli.status_codes import UNKNOWN_ERROR
+from pip._internal.configuration import Configuration, ConfigurationError
+from pip._internal.utils.misc import redact_auth_from_url, strtobool
 
-Click uses parts of optparse written by Gregory P. Ward and maintained
-by the Python Software Foundation. This is limited to code in parser.py.
-
-Copyright 2001-2006 Gregory P. Ward. All rights reserved.
-Copyright 2002-2006 Python Software Foundation. All rights reserved.
-"""
-# This code uses parts of optparse written by Gregory P. Ward and
-# maintained by the Python Software Foundation.
-# Copyright 2001-2006 Gregory P. Ward
-# Copyright 2002-2006 Python Software Foundation
-import typing as t
-from collections import deque
-from gettext import gettext as _
-from gettext import ngettext
-
-from .exceptions import BadArgumentUsage
-from .exceptions import BadOptionUsage
-from .exceptions import NoSuchOption
-from .exceptions import UsageError
-
-if t.TYPE_CHECKING:
-    import typing_extensions as te
-    from .core import Argument as CoreArgument
-    from .core import Context
-    from .core import Option as CoreOption
-    from .core import Parameter as CoreParameter
-
-V = t.TypeVar("V")
-
-# Sentinel value that indicates an option was passed as a flag without a
-# value but is not a flag option. Option.consume_value uses this to
-# prompt or use the flag_value.
-_flag_needs_value = object()
+logger = logging.getLogger(__name__)
 
 
-def _unpack_args(
-    args: t.Sequence[str], nargs_spec: t.Sequence[int]
-) -> t.Tuple[t.Sequence[t.Union[str, t.Sequence[t.Optional[str]], None]], t.List[str]]:
-    """Given an iterable of arguments and an iterable of nargs specifications,
-    it returns a tuple with all the unpacked arguments at the first index
-    and all remaining arguments as the second.
+class PrettyHelpFormatter(optparse.IndentedHelpFormatter):
+    """A prettier/less verbose help formatter for optparse."""
 
-    The nargs specification is the number of arguments that should be consumed
-    or `-1` to indicate that this position should eat up all the remainders.
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # help position must be aligned with __init__.parseopts.description
+        kwargs["max_help_position"] = 30
+        kwargs["indent_increment"] = 1
+        kwargs["width"] = shutil.get_terminal_size()[0] - 2
+        super().__init__(*args, **kwargs)
 
-    Missing items are filled with `None`.
-    """
-    args = deque(args)
-    nargs_spec = deque(nargs_spec)
-    rv: t.List[t.Union[str, t.Tuple[t.Optional[str], ...], None]] = []
-    spos: t.Optional[int] = None
+    def format_option_strings(self, option: optparse.Option) -> str:
+        return self._format_option_strings(option)
 
-    def _fetch(c: "te.Deque[V]") -> t.Optional[V]:
-        try:
-            if spos is None:
-                return c.popleft()
+    def _format_option_strings(
+        self, option: optparse.Option, mvarfmt: str = " <{}>", optsep: str = ", "
+    ) -> str:
+        """
+        Return a comma-separated list of option strings and metavars.
+
+        :param option:  tuple of (short opt, long opt), e.g: ('-f', '--format')
+        :param mvarfmt: metavar format string
+        :param optsep:  separator
+        """
+        opts = []
+
+        if option._short_opts:
+            opts.append(option._short_opts[0])
+        if option._long_opts:
+            opts.append(option._long_opts[0])
+        if len(opts) > 1:
+            opts.insert(1, optsep)
+
+        if option.takes_value():
+            assert option.dest is not None
+            metavar = option.metavar or option.dest.lower()
+            opts.append(mvarfmt.format(metavar.lower()))
+
+        return "".join(opts)
+
+    def format_heading(self, heading: str) -> str:
+        if heading == "Options":
+            return ""
+        return heading + ":\n"
+
+    def format_usage(self, usage: str) -> str:
+        """
+        Ensure there is only one newline between usage and the first heading
+        if there is no description.
+        """
+        msg = "\nUsage: {}\n".format(self.indent_lines(textwrap.dedent(usage), "  "))
+        return msg
+
+    def format_description(self, description: Optional[str]) -> str:
+        # leave full control over description to us
+        if description:
+            if hasattr(self.parser, "main"):
+                label = "Commands"
             else:
-                return c.pop()
-        except IndexError:
-            return None
+                label = "Description"
+            # some doc strings have initial newlines, some don't
+            description = description.lstrip("\n")
+            # some doc strings have final newlines and spaces, some don't
+            description = description.rstrip()
+            # dedent, then reindent
+            description = self.indent_lines(textwrap.dedent(description), "  ")
+            description = f"{label}:\n{description}\n"
+            return description
+        else:
+            return ""
 
-    while nargs_spec:
-        nargs = _fetch(nargs_spec)
+    def format_epilog(self, epilog: Optional[str]) -> str:
+        # leave full control over epilog to us
+        if epilog:
+            return epilog
+        else:
+            return ""
 
-        if nargs is None:
-            continue
-
-        if nargs == 1:
-            rv.append(_fetch(args))
-        elif nargs > 1:
-            x = [_fetch(args) for _ in range(nargs)]
-
-            # If we're reversed, we're pulling in the arguments in reverse,
-            # so we need to turn them around.
-            if spos is not None:
-                x.reverse()
-
-            rv.append(tuple(x))
-        elif nargs < 0:
-            if spos is not None:
-                raise TypeError("Cannot have two nargs < 0")
-
-            spos = len(rv)
-            rv.append(None)
-
-    # spos is the position of the wildcard (star).  If it's not `None`,
-    # we fill it with the remainder.
-    if spos is not None:
-        rv[spos] = tuple(args)
-        args = []
-        rv[spos + 1 :] = reversed(rv[spos + 1 :])
-
-    return tuple(rv), list(args)
+    def indent_lines(self, text: str, indent: str) -> str:
+        new_lines = [indent + line for line in text.split("\n")]
+        return "\n".join(new_lines)
 
 
-def split_opt(opt: str) -> t.Tuple[str, str]:
-    first = opt[:1]
-    if first.isalnum():
-        return "", opt
-    if opt[1:2] == first:
-        return opt[:2], opt[2:]
-    return first, opt[1:]
+class UpdatingDefaultsHelpFormatter(PrettyHelpFormatter):
+    """Custom help formatter for use in ConfigOptionParser.
 
+    This is updates the defaults before expanding them, allowing
+    them to show up correctly in the help listing.
 
-def normalize_opt(opt: str, ctx: t.Optional["Context"]) -> str:
-    if ctx is None or ctx.token_normalize_func is None:
-        return opt
-    prefix, opt = split_opt(opt)
-    return f"{prefix}{ctx.token_normalize_func(opt)}"
-
-
-def split_arg_string(string: str) -> t.List[str]:
-    """Split an argument string as with :func:`shlex.split`, but don't
-    fail if the string is incomplete. Ignores a missing closing quote or
-    incomplete escape sequence and uses the partial token as-is.
-
-    .. code-block:: python
-
-        split_arg_string("example 'my file")
-        ["example", "my file"]
-
-        split_arg_string("example my\\")
-        ["example", "my"]
-
-    :param string: String to split.
+    Also redact auth from url type options
     """
-    import shlex
 
-    lex = shlex.shlex(string, posix=True)
-    lex.whitespace_split = True
-    lex.commenters = ""
-    out = []
+    def expand_default(self, option: optparse.Option) -> str:
+        default_values = None
+        if self.parser is not None:
+            assert isinstance(self.parser, ConfigOptionParser)
+            self.parser._update_defaults(self.parser.defaults)
+            assert option.dest is not None
+            default_values = self.parser.defaults.get(option.dest)
+        help_text = super().expand_default(option)
 
-    try:
-        for token in lex:
-            out.append(token)
-    except ValueError:
-        # Raised when end-of-string is reached in an invalid state. Use
-        # the partial token as-is. The quote or escape character is in
-        # lex.state, not lex.token.
-        out.append(lex.token)
+        if default_values and option.metavar == "URL":
+            if isinstance(default_values, str):
+                default_values = [default_values]
 
-    return out
+            # If its not a list, we should abort and just return the help text
+            if not isinstance(default_values, list):
+                default_values = []
+
+            for val in default_values:
+                help_text = help_text.replace(val, redact_auth_from_url(val))
+
+        return help_text
 
 
-class Option:
-    def __init__(
-        self,
-        obj: "CoreOption",
-        opts: t.Sequence[str],
-        dest: t.Optional[str],
-        action: t.Optional[str] = None,
-        nargs: int = 1,
-        const: t.Optional[t.Any] = None,
-    ):
-        self._short_opts = []
-        self._long_opts = []
-        self.prefixes: t.Set[str] = set()
+class CustomOptionParser(optparse.OptionParser):
+    def insert_option_group(
+        self, idx: int, *args: Any, **kwargs: Any
+    ) -> optparse.OptionGroup:
+        """Insert an OptionGroup at a given position."""
+        group = self.add_option_group(*args, **kwargs)
 
-        for opt in opts:
-            prefix, value = split_opt(opt)
-            if not prefix:
-                raise ValueError(f"Invalid start character for option ({opt})")
-            self.prefixes.add(prefix[0])
-            if len(prefix) == 1 and len(value) == 1:
-                self._short_opts.append(opt)
-            else:
-                self._long_opts.append(opt)
-                self.prefixes.add(prefix)
+        self.option_groups.pop()
+        self.option_groups.insert(idx, group)
 
-        if action is None:
-            action = "store"
-
-        self.dest = dest
-        self.action = action
-        self.nargs = nargs
-        self.const = const
-        self.obj = obj
+        return group
 
     @property
-    def takes_value(self) -> bool:
-        return self.action in ("store", "append")
+    def option_list_all(self) -> List[optparse.Option]:
+        """Get a list of all options, including those in option groups."""
+        res = self.option_list[:]
+        for i in self.option_groups:
+            res.extend(i.option_list)
 
-    def process(self, value: t.Any, state: "ParsingState") -> None:
-        if self.action == "store":
-            state.opts[self.dest] = value  # type: ignore
-        elif self.action == "store_const":
-            state.opts[self.dest] = self.const  # type: ignore
-        elif self.action == "append":
-            state.opts.setdefault(self.dest, []).append(value)  # type: ignore
-        elif self.action == "append_const":
-            state.opts.setdefault(self.dest, []).append(self.const)  # type: ignore
-        elif self.action == "count":
-            state.opts[self.dest] = state.opts.get(self.dest, 0) + 1  # type: ignore
-        else:
-            raise ValueError(f"unknown action '{self.action}'")
-        state.order.append(self.obj)
+        return res
 
 
-class Argument:
-    def __init__(self, obj: "CoreArgument", dest: t.Optional[str], nargs: int = 1):
-        self.dest = dest
-        self.nargs = nargs
-        self.obj = obj
+class ConfigOptionParser(CustomOptionParser):
+    """Custom option parser which updates its defaults by checking the
+    configuration files and environmental variables"""
 
-    def process(
+    def __init__(
         self,
-        value: t.Union[t.Optional[str], t.Sequence[t.Optional[str]]],
-        state: "ParsingState",
+        *args: Any,
+        name: str,
+        isolated: bool = False,
+        **kwargs: Any,
     ) -> None:
-        if self.nargs > 1:
-            assert value is not None
-            holes = sum(1 for x in value if x is None)
-            if holes == len(value):
-                value = None
-            elif holes != 0:
-                raise BadArgumentUsage(
-                    _("Argument {name!r} takes {nargs} values.").format(
-                        name=self.dest, nargs=self.nargs
+        self.name = name
+        self.config = Configuration(isolated)
+
+        assert self.name
+        super().__init__(*args, **kwargs)
+
+    def check_default(self, option: optparse.Option, key: str, val: Any) -> Any:
+        try:
+            return option.check_value(key, val)
+        except optparse.OptionValueError as exc:
+            print(f"An error occurred during configuration: {exc}")
+            sys.exit(3)
+
+    def _get_ordered_configuration_items(
+        self,
+    ) -> Generator[Tuple[str, Any], None, None]:
+        # Configuration gives keys in an unordered manner. Order them.
+        override_order = ["global", self.name, ":env:"]
+
+        # Pool the options into different groups
+        section_items: Dict[str, List[Tuple[str, Any]]] = {
+            name: [] for name in override_order
+        }
+        for section_key, val in self.config.items():
+            # ignore empty values
+            if not val:
+                logger.debug(
+                    "Ignoring configuration key '%s' as it's value is empty.",
+                    section_key,
+                )
+                continue
+
+            section, key = section_key.split(".", 1)
+            if section in override_order:
+                section_items[section].append((key, val))
+
+        # Yield each group in their override order
+        for section in override_order:
+            for key, val in section_items[section]:
+                yield key, val
+
+    def _update_defaults(self, defaults: Dict[str, Any]) -> Dict[str, Any]:
+        """Updates the given defaults with values from the config files and
+        the environ. Does a little special handling for certain types of
+        options (lists)."""
+
+        # Accumulate complex default state.
+        self.values = optparse.Values(self.defaults)
+        late_eval = set()
+        # Then set the options with those values
+        for key, val in self._get_ordered_configuration_items():
+            # '--' because configuration supports only long names
+            option = self.get_option("--" + key)
+
+            # Ignore options not present in this parser. E.g. non-globals put
+            # in [global] by users that want them to apply to all applicable
+            # commands.
+            if option is None:
+                continue
+
+            assert option.dest is not None
+
+            if option.action in ("store_true", "store_false"):
+                try:
+                    val = strtobool(val)
+                except ValueError:
+                    self.error(
+                        f"{val} is not a valid value for {key} option, "
+                        "please specify a boolean value like yes/no, "
+                        "true/false or 1/0 instead."
                     )
-                )
+            elif option.action == "count":
+                with suppress(ValueError):
+                    val = strtobool(val)
+                with suppress(ValueError):
+                    val = int(val)
+                if not isinstance(val, int) or val < 0:
+                    self.error(
+                        f"{val} is not a valid value for {key} option, "
+                        "please instead specify either a non-negative integer "
+                        "or a boolean value like yes/no or false/true "
+                        "which is equivalent to 1/0."
+                    )
+            elif option.action == "append":
+                val = val.split()
+                val = [self.check_default(option, key, v) for v in val]
+            elif option.action == "callback":
+                assert option.callback is not None
+                late_eval.add(option.dest)
+                opt_str = option.get_opt_string()
+                val = option.convert_value(opt_str, val)
+                # From take_action
+                args = option.callback_args or ()
+                kwargs = option.callback_kwargs or {}
+                option.callback(option, opt_str, val, self, *args, **kwargs)
+            else:
+                val = self.check_default(option, key, val)
 
-        if self.nargs == -1 and self.obj.envvar is not None and value == ():
-            # Replace empty tuple with None so that a value from the
-            # environment may be tried.
-            value = None
+            defaults[option.dest] = val
 
-        state.opts[self.dest] = value  # type: ignore
-        state.order.append(self.obj)
+        for key in late_eval:
+            defaults[key] = getattr(self.values, key)
+        self.values = None
+        return defaults
 
+    def get_default_values(self) -> optparse.Values:
+        """Overriding to make updating the defaults after instantiation of
+        the option parser possible, _update_defaults() does the dirty work."""
+        if not self.process_default_values:
+            # Old, pre-Optik 1.5 behaviour.
+            return optparse.Values(self.defaults)
 
-class ParsingState:
-    def __init__(self, rargs: t.List[str]) -> None:
-        self.opts: t.Dict[str, t.Any] = {}
-        self.largs: t.List[str] = []
-        self.rargs = rargs
-        self.order: t.List["CoreParameter"] = []
-
-
-class OptionParser:
-    """The option parser is an internal class that is ultimately used to
-    parse options and arguments.  It's modelled after optparse and brings
-    a similar but vastly simplified API.  It should generally not be used
-    directly as the high level Click classes wrap it for you.
-
-    It's not nearly as extensible as optparse or argparse as it does not
-    implement features that are implemented on a higher level (such as
-    types or defaults).
-
-    :param ctx: optionally the :class:`~click.Context` where this parser
-                should go with.
-    """
-
-    def __init__(self, ctx: t.Optional["Context"] = None) -> None:
-        #: The :class:`~click.Context` for this parser.  This might be
-        #: `None` for some advanced use cases.
-        self.ctx = ctx
-        #: This controls how the parser deals with interspersed arguments.
-        #: If this is set to `False`, the parser will stop on the first
-        #: non-option.  Click uses this to implement nested subcommands
-        #: safely.
-        self.allow_interspersed_args: bool = True
-        #: This tells the parser how to deal with unknown options.  By
-        #: default it will error out (which is sensible), but there is a
-        #: second mode where it will ignore it and continue processing
-        #: after shifting all the unknown options into the resulting args.
-        self.ignore_unknown_options: bool = False
-
-        if ctx is not None:
-            self.allow_interspersed_args = ctx.allow_interspersed_args
-            self.ignore_unknown_options = ctx.ignore_unknown_options
-
-        self._short_opt: t.Dict[str, Option] = {}
-        self._long_opt: t.Dict[str, Option] = {}
-        self._opt_prefixes = {"-", "--"}
-        self._args: t.List[Argument] = []
-
-    def add_option(
-        self,
-        obj: "CoreOption",
-        opts: t.Sequence[str],
-        dest: t.Optional[str],
-        action: t.Optional[str] = None,
-        nargs: int = 1,
-        const: t.Optional[t.Any] = None,
-    ) -> None:
-        """Adds a new option named `dest` to the parser.  The destination
-        is not inferred (unlike with optparse) and needs to be explicitly
-        provided.  Action can be any of ``store``, ``store_const``,
-        ``append``, ``append_const`` or ``count``.
-
-        The `obj` can be used to identify the option in the order list
-        that is returned from the parser.
-        """
-        opts = [normalize_opt(opt, self.ctx) for opt in opts]
-        option = Option(obj, opts, dest, action=action, nargs=nargs, const=const)
-        self._opt_prefixes.update(option.prefixes)
-        for opt in option._short_opts:
-            self._short_opt[opt] = option
-        for opt in option._long_opts:
-            self._long_opt[opt] = option
-
-    def add_argument(
-        self, obj: "CoreArgument", dest: t.Optional[str], nargs: int = 1
-    ) -> None:
-        """Adds a positional argument named `dest` to the parser.
-
-        The `obj` can be used to identify the option in the order list
-        that is returned from the parser.
-        """
-        self._args.append(Argument(obj, dest=dest, nargs=nargs))
-
-    def parse_args(
-        self, args: t.List[str]
-    ) -> t.Tuple[t.Dict[str, t.Any], t.List[str], t.List["CoreParameter"]]:
-        """Parses positional arguments and returns ``(values, args, order)``
-        for the parsed options and arguments as well as the leftover
-        arguments if there are any.  The order is a list of objects as they
-        appear on the command line.  If arguments appear multiple times they
-        will be memorized multiple times as well.
-        """
-        state = ParsingState(args)
+        # Load the configuration, or error out in case of an error
         try:
-            self._process_args_for_options(state)
-            self._process_args_for_args(state)
-        except UsageError:
-            if self.ctx is None or not self.ctx.resilient_parsing:
-                raise
-        return state.opts, state.largs, state.order
+            self.config.load()
+        except ConfigurationError as err:
+            self.exit(UNKNOWN_ERROR, str(err))
 
-    def _process_args_for_args(self, state: ParsingState) -> None:
-        pargs, args = _unpack_args(
-            state.largs + state.rargs, [x.nargs for x in self._args]
-        )
+        defaults = self._update_defaults(self.defaults.copy())  # ours
+        for option in self._get_all_options():
+            assert option.dest is not None
+            default = defaults.get(option.dest)
+            if isinstance(default, str):
+                opt_str = option.get_opt_string()
+                defaults[option.dest] = option.check_value(opt_str, default)
+        return optparse.Values(defaults)
 
-        for idx, arg in enumerate(self._args):
-            arg.process(pargs[idx], state)
-
-        state.largs = args
-        state.rargs = []
-
-    def _process_args_for_options(self, state: ParsingState) -> None:
-        while state.rargs:
-            arg = state.rargs.pop(0)
-            arglen = len(arg)
-            # Double dashes always handled explicitly regardless of what
-            # prefixes are valid.
-            if arg == "--":
-                return
-            elif arg[:1] in self._opt_prefixes and arglen > 1:
-                self._process_opts(arg, state)
-            elif self.allow_interspersed_args:
-                state.largs.append(arg)
-            else:
-                state.rargs.insert(0, arg)
-                return
-
-        # Say this is the original argument list:
-        # [arg0, arg1, ..., arg(i-1), arg(i), arg(i+1), ..., arg(N-1)]
-        #                            ^
-        # (we are about to process arg(i)).
-        #
-        # Then rargs is [arg(i), ..., arg(N-1)] and largs is a *subset* of
-        # [arg0, ..., arg(i-1)] (any options and their arguments will have
-        # been removed from largs).
-        #
-        # The while loop will usually consume 1 or more arguments per pass.
-        # If it consumes 1 (eg. arg is an option that takes no arguments),
-        # then after _process_arg() is done the situation is:
-        #
-        #   largs = subset of [arg0, ..., arg(i)]
-        #   rargs = [arg(i+1), ..., arg(N-1)]
-        #
-        # If allow_interspersed_args is false, largs will always be
-        # *empty* -- still a subset of [arg0, ..., arg(i-1)], but
-        # not a very interesting subset!
-
-    def _match_long_opt(
-        self, opt: str, explicit_value: t.Optional[str], state: ParsingState
-    ) -> None:
-        if opt not in self._long_opt:
-            from difflib import get_close_matches
-
-            possibilities = get_close_matches(opt, self._long_opt)
-            raise NoSuchOption(opt, possibilities=possibilities, ctx=self.ctx)
-
-        option = self._long_opt[opt]
-        if option.takes_value:
-            # At this point it's safe to modify rargs by injecting the
-            # explicit value, because no exception is raised in this
-            # branch.  This means that the inserted value will be fully
-            # consumed.
-            if explicit_value is not None:
-                state.rargs.insert(0, explicit_value)
-
-            value = self._get_value_from_state(opt, option, state)
-
-        elif explicit_value is not None:
-            raise BadOptionUsage(
-                opt, _("Option {name!r} does not take a value.").format(name=opt)
-            )
-
-        else:
-            value = None
-
-        option.process(value, state)
-
-    def _match_short_opt(self, arg: str, state: ParsingState) -> None:
-        stop = False
-        i = 1
-        prefix = arg[0]
-        unknown_options = []
-
-        for ch in arg[1:]:
-            opt = normalize_opt(f"{prefix}{ch}", self.ctx)
-            option = self._short_opt.get(opt)
-            i += 1
-
-            if not option:
-                if self.ignore_unknown_options:
-                    unknown_options.append(ch)
-                    continue
-                raise NoSuchOption(opt, ctx=self.ctx)
-            if option.takes_value:
-                # Any characters left in arg?  Pretend they're the
-                # next arg, and stop consuming characters of arg.
-                if i < len(arg):
-                    state.rargs.insert(0, arg[i:])
-                    stop = True
-
-                value = self._get_value_from_state(opt, option, state)
-
-            else:
-                value = None
-
-            option.process(value, state)
-
-            if stop:
-                break
-
-        # If we got any unknown options we recombine the string of the
-        # remaining options and re-attach the prefix, then report that
-        # to the state as new larg.  This way there is basic combinatorics
-        # that can be achieved while still ignoring unknown arguments.
-        if self.ignore_unknown_options and unknown_options:
-            state.largs.append(f"{prefix}{''.join(unknown_options)}")
-
-    def _get_value_from_state(
-        self, option_name: str, option: Option, state: ParsingState
-    ) -> t.Any:
-        nargs = option.nargs
-
-        if len(state.rargs) < nargs:
-            if option.obj._flag_needs_value:
-                # Option allows omitting the value.
-                value = _flag_needs_value
-            else:
-                raise BadOptionUsage(
-                    option_name,
-                    ngettext(
-                        "Option {name!r} requires an argument.",
-                        "Option {name!r} requires {nargs} arguments.",
-                        nargs,
-                    ).format(name=option_name, nargs=nargs),
-                )
-        elif nargs == 1:
-            next_rarg = state.rargs[0]
-
-            if (
-                option.obj._flag_needs_value
-                and isinstance(next_rarg, str)
-                and next_rarg[:1] in self._opt_prefixes
-                and len(next_rarg) > 1
-            ):
-                # The next arg looks like the start of an option, don't
-                # use it as the value if omitting the value is allowed.
-                value = _flag_needs_value
-            else:
-                value = state.rargs.pop(0)
-        else:
-            value = tuple(state.rargs[:nargs])
-            del state.rargs[:nargs]
-
-        return value
-
-    def _process_opts(self, arg: str, state: ParsingState) -> None:
-        explicit_value = None
-        # Long option handling happens in two parts.  The first part is
-        # supporting explicitly attached values.  In any case, we will try
-        # to long match the option first.
-        if "=" in arg:
-            long_opt, explicit_value = arg.split("=", 1)
-        else:
-            long_opt = arg
-        norm_long_opt = normalize_opt(long_opt, self.ctx)
-
-        # At this point we will match the (assumed) long option through
-        # the long option matching code.  Note that this allows options
-        # like "-foo" to be matched as long options.
-        try:
-            self._match_long_opt(norm_long_opt, explicit_value, state)
-        except NoSuchOption:
-            # At this point the long option matching failed, and we need
-            # to try with short options.  However there is a special rule
-            # which says, that if we have a two character options prefix
-            # (applies to "--foo" for instance), we do not dispatch to the
-            # short option code and will instead raise the no option
-            # error.
-            if arg[:2] not in self._opt_prefixes:
-                self._match_short_opt(arg, state)
-                return
-
-            if not self.ignore_unknown_options:
-                raise
-
-            state.largs.append(arg)
+    def error(self, msg: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        self.exit(UNKNOWN_ERROR, f"{msg}\n")
