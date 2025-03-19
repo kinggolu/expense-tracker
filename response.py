@@ -1,879 +1,835 @@
-from __future__ import absolute_import
+from __future__ import annotations
 
-import io
-import logging
-import sys
-import warnings
-import zlib
-from contextlib import contextmanager
-from socket import error as SocketError
-from socket import timeout as SocketTimeout
+import json
+import typing as t
+from http import HTTPStatus
+from urllib.parse import urljoin
 
-brotli = None
+from ..datastructures import Headers
+from ..http import remove_entity_headers
+from ..sansio.response import Response as _SansIOResponse
+from ..urls import _invalid_iri_to_uri
+from ..urls import iri_to_uri
+from ..utils import cached_property
+from ..wsgi import ClosingIterator
+from ..wsgi import get_current_url
+from werkzeug._internal import _get_environ
+from werkzeug.http import generate_etag
+from werkzeug.http import http_date
+from werkzeug.http import is_resource_modified
+from werkzeug.http import parse_etags
+from werkzeug.http import parse_range_header
+from werkzeug.wsgi import _RangeWrapper
 
-from . import util
-from ._collections import HTTPHeaderDict
-from .connection import BaseSSLError, HTTPException
-from .exceptions import (
-    BodyNotHttplibCompatible,
-    DecodeError,
-    HTTPError,
-    IncompleteRead,
-    InvalidChunkLength,
-    InvalidHeader,
-    ProtocolError,
-    ReadTimeoutError,
-    ResponseNotChunked,
-    SSLError,
-)
-from .packages import six
-from .util.response import is_fp_closed, is_response_to_head
-
-log = logging.getLogger(__name__)
+if t.TYPE_CHECKING:
+    from _typeshed.wsgi import StartResponse
+    from _typeshed.wsgi import WSGIApplication
+    from _typeshed.wsgi import WSGIEnvironment
+    from .request import Request
 
 
-class DeflateDecoder(object):
-    def __init__(self):
-        self._first_try = True
-        self._data = b""
-        self._obj = zlib.decompressobj()
-
-    def __getattr__(self, name):
-        return getattr(self._obj, name)
-
-    def decompress(self, data):
-        if not data:
-            return data
-
-        if not self._first_try:
-            return self._obj.decompress(data)
-
-        self._data += data
-        try:
-            decompressed = self._obj.decompress(data)
-            if decompressed:
-                self._first_try = False
-                self._data = None
-            return decompressed
-        except zlib.error:
-            self._first_try = False
-            self._obj = zlib.decompressobj(-zlib.MAX_WBITS)
-            try:
-                return self.decompress(self._data)
-            finally:
-                self._data = None
+def _iter_encoded(iterable: t.Iterable[str | bytes], charset: str) -> t.Iterator[bytes]:
+    for item in iterable:
+        if isinstance(item, str):
+            yield item.encode(charset)
+        else:
+            yield item
 
 
-class GzipDecoderState(object):
+class Response(_SansIOResponse):
+    """Represents an outgoing WSGI HTTP response with body, status, and
+    headers. Has properties and methods for using the functionality
+    defined by various HTTP specs.
 
-    FIRST_MEMBER = 0
-    OTHER_MEMBERS = 1
-    SWALLOW_DATA = 2
+    The response body is flexible to support different use cases. The
+    simple form is passing bytes, or a string which will be encoded as
+    UTF-8. Passing an iterable of bytes or strings makes this a
+    streaming response. A generator is particularly useful for building
+    a CSV file in memory or using SSE (Server Sent Events). A file-like
+    object is also iterable, although the
+    :func:`~werkzeug.utils.send_file` helper should be used in that
+    case.
 
+    The response object is itself a WSGI application callable. When
+    called (:meth:`__call__`) with ``environ`` and ``start_response``,
+    it will pass its status and headers to ``start_response`` then
+    return its body as an iterable.
 
-class GzipDecoder(object):
-    def __init__(self):
-        self._obj = zlib.decompressobj(16 + zlib.MAX_WBITS)
-        self._state = GzipDecoderState.FIRST_MEMBER
+    .. code-block:: python
 
-    def __getattr__(self, name):
-        return getattr(self._obj, name)
+        from werkzeug.wrappers.response import Response
 
-    def decompress(self, data):
-        ret = bytearray()
-        if self._state == GzipDecoderState.SWALLOW_DATA or not data:
-            return bytes(ret)
-        while True:
-            try:
-                ret += self._obj.decompress(data)
-            except zlib.error:
-                previous_state = self._state
-                # Ignore data after the first error
-                self._state = GzipDecoderState.SWALLOW_DATA
-                if previous_state == GzipDecoderState.OTHER_MEMBERS:
-                    # Allow trailing garbage acceptable in other gzip clients
-                    return bytes(ret)
-                raise
-            data = self._obj.unused_data
-            if not data:
-                return bytes(ret)
-            self._state = GzipDecoderState.OTHER_MEMBERS
-            self._obj = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        def index():
+            return Response("Hello, World!")
 
+        def application(environ, start_response):
+            path = environ.get("PATH_INFO") or "/"
 
-if brotli is not None:
-
-    class BrotliDecoder(object):
-        # Supports both 'brotlipy' and 'Brotli' packages
-        # since they share an import name. The top branches
-        # are for 'brotlipy' and bottom branches for 'Brotli'
-        def __init__(self):
-            self._obj = brotli.Decompressor()
-            if hasattr(self._obj, "decompress"):
-                self.decompress = self._obj.decompress
+            if path == "/":
+                response = index()
             else:
-                self.decompress = self._obj.process
+                response = Response("Not Found", status=404)
 
-        def flush(self):
-            if hasattr(self._obj, "flush"):
-                return self._obj.flush()
-            return b""
+            return response(environ, start_response)
 
+    :param response: The data for the body of the response. A string or
+        bytes, or tuple or list of strings or bytes, for a fixed-length
+        response, or any other iterable of strings or bytes for a
+        streaming response. Defaults to an empty body.
+    :param status: The status code for the response. Either an int, in
+        which case the default status message is added, or a string in
+        the form ``{code} {message}``, like ``404 Not Found``. Defaults
+        to 200.
+    :param headers: A :class:`~werkzeug.datastructures.Headers` object,
+        or a list of ``(key, value)`` tuples that will be converted to a
+        ``Headers`` object.
+    :param mimetype: The mime type (content type without charset or
+        other parameters) of the response. If the value starts with
+        ``text/`` (or matches some other special cases), the charset
+        will be added to create the ``content_type``.
+    :param content_type: The full content type of the response.
+        Overrides building the value from ``mimetype``.
+    :param direct_passthrough: Pass the response body directly through
+        as the WSGI iterable. This can be used when the body is a binary
+        file or other iterator of bytes, to skip some unnecessary
+        checks. Use :func:`~werkzeug.utils.send_file` instead of setting
+        this manually.
 
-class MultiDecoder(object):
-    """
-    From RFC7231:
-        If one or more encodings have been applied to a representation, the
-        sender that applied the encodings MUST generate a Content-Encoding
-        header field that lists the content codings in the order in which
-        they were applied.
-    """
+    .. versionchanged:: 2.1
+        Old ``BaseResponse`` and mixin classes were removed.
 
-    def __init__(self, modes):
-        self._decoders = [_get_decoder(m.strip()) for m in modes.split(",")]
+    .. versionchanged:: 2.0
+        Combine ``BaseResponse`` and mixins into a single ``Response``
+        class.
 
-    def flush(self):
-        return self._decoders[0].flush()
-
-    def decompress(self, data):
-        for d in reversed(self._decoders):
-            data = d.decompress(data)
-        return data
-
-
-def _get_decoder(mode):
-    if "," in mode:
-        return MultiDecoder(mode)
-
-    if mode == "gzip":
-        return GzipDecoder()
-
-    if brotli is not None and mode == "br":
-        return BrotliDecoder()
-
-    return DeflateDecoder()
-
-
-class HTTPResponse(io.IOBase):
-    """
-    HTTP Response container.
-
-    Backwards-compatible with :class:`http.client.HTTPResponse` but the response ``body`` is
-    loaded and decoded on-demand when the ``data`` property is accessed.  This
-    class is also compatible with the Python standard library's :mod:`io`
-    module, and can hence be treated as a readable object in the context of that
-    framework.
-
-    Extra parameters for behaviour not present in :class:`http.client.HTTPResponse`:
-
-    :param preload_content:
-        If True, the response's body will be preloaded during construction.
-
-    :param decode_content:
-        If True, will attempt to decode the body based on the
-        'content-encoding' header.
-
-    :param original_response:
-        When this HTTPResponse wrapper is generated from an :class:`http.client.HTTPResponse`
-        object, it's convenient to include the original for debug purposes. It's
-        otherwise unused.
-
-    :param retries:
-        The retries contains the last :class:`~urllib3.util.retry.Retry` that
-        was used during the request.
-
-    :param enforce_content_length:
-        Enforce content length checking. Body returned by server must match
-        value of Content-Length header, if present. Otherwise, raise error.
+    .. versionchanged:: 0.5
+        The ``direct_passthrough`` parameter was added.
     """
 
-    CONTENT_DECODERS = ["gzip", "deflate"]
-    if brotli is not None:
-        CONTENT_DECODERS += ["br"]
-    REDIRECT_STATUSES = [301, 302, 303, 307, 308]
+    #: if set to `False` accessing properties on the response object will
+    #: not try to consume the response iterator and convert it into a list.
+    #:
+    #: .. versionadded:: 0.6.2
+    #:
+    #:    That attribute was previously called `implicit_seqence_conversion`.
+    #:    (Notice the typo).  If you did use this feature, you have to adapt
+    #:    your code to the name change.
+    implicit_sequence_conversion = True
+
+    #: If a redirect ``Location`` header is a relative URL, make it an
+    #: absolute URL, including scheme and domain.
+    #:
+    #: .. versionchanged:: 2.1
+    #:     This is disabled by default, so responses will send relative
+    #:     redirects.
+    #:
+    #: .. versionadded:: 0.8
+    autocorrect_location_header = False
+
+    #: Should this response object automatically set the content-length
+    #: header if possible?  This is true by default.
+    #:
+    #: .. versionadded:: 0.8
+    automatically_set_content_length = True
+
+    #: The response body to send as the WSGI iterable. A list of strings
+    #: or bytes represents a fixed-length response, any other iterable
+    #: is a streaming response. Strings are encoded to bytes as UTF-8.
+    #:
+    #: Do not set to a plain string or bytes, that will cause sending
+    #: the response to be very inefficient as it will iterate one byte
+    #: at a time.
+    response: t.Iterable[str] | t.Iterable[bytes]
 
     def __init__(
         self,
-        body="",
-        headers=None,
-        status=0,
-        version=0,
-        reason=None,
-        strict=0,
-        preload_content=True,
-        decode_content=True,
-        original_response=None,
-        pool=None,
-        connection=None,
-        msg=None,
-        retries=None,
-        enforce_content_length=False,
-        request_method=None,
-        request_url=None,
-        auto_close=True,
-    ):
+        response: t.Iterable[bytes] | bytes | t.Iterable[str] | str | None = None,
+        status: int | str | HTTPStatus | None = None,
+        headers: t.Mapping[str, str | t.Iterable[str]]
+        | t.Iterable[tuple[str, str]]
+        | None = None,
+        mimetype: str | None = None,
+        content_type: str | None = None,
+        direct_passthrough: bool = False,
+    ) -> None:
+        super().__init__(
+            status=status,
+            headers=headers,
+            mimetype=mimetype,
+            content_type=content_type,
+        )
 
-        if isinstance(headers, HTTPHeaderDict):
-            self.headers = headers
+        #: Pass the response body directly through as the WSGI iterable.
+        #: This can be used when the body is a binary file or other
+        #: iterator of bytes, to skip some unnecessary checks. Use
+        #: :func:`~werkzeug.utils.send_file` instead of setting this
+        #: manually.
+        self.direct_passthrough = direct_passthrough
+        self._on_close: list[t.Callable[[], t.Any]] = []
+
+        # we set the response after the headers so that if a class changes
+        # the charset attribute, the data is set in the correct charset.
+        if response is None:
+            self.response = []
+        elif isinstance(response, (str, bytes, bytearray)):
+            self.set_data(response)
         else:
-            self.headers = HTTPHeaderDict(headers)
-        self.status = status
-        self.version = version
-        self.reason = reason
-        self.strict = strict
-        self.decode_content = decode_content
-        self.retries = retries
-        self.enforce_content_length = enforce_content_length
-        self.auto_close = auto_close
+            self.response = response
 
-        self._decoder = None
-        self._body = None
-        self._fp = None
-        self._original_response = original_response
-        self._fp_bytes_read = 0
-        self.msg = msg
-        self._request_url = request_url
+    def call_on_close(self, func: t.Callable[[], t.Any]) -> t.Callable[[], t.Any]:
+        """Adds a function to the internal list of functions that should
+        be called as part of closing down the response.  Since 0.7 this
+        function also returns the function that was passed so that this
+        can be used as a decorator.
 
-        if body and isinstance(body, (six.string_types, bytes)):
-            self._body = body
-
-        self._pool = pool
-        self._connection = connection
-
-        if hasattr(body, "read"):
-            self._fp = body
-
-        # Are we using the chunked-style of transfer encoding?
-        self.chunked = False
-        self.chunk_left = None
-        tr_enc = self.headers.get("transfer-encoding", "").lower()
-        # Don't incur the penalty of creating a list and then discarding it
-        encodings = (enc.strip() for enc in tr_enc.split(","))
-        if "chunked" in encodings:
-            self.chunked = True
-
-        # Determine length of response
-        self.length_remaining = self._init_length(request_method)
-
-        # If requested, preload the body.
-        if preload_content and not self._body:
-            self._body = self.read(decode_content=decode_content)
-
-    def get_redirect_location(self):
+        .. versionadded:: 0.6
         """
-        Should we redirect and where to?
+        self._on_close.append(func)
+        return func
 
-        :returns: Truthy redirect location string if we got a redirect status
-            code and valid location. ``None`` if redirect status and no
-            location. ``False`` if not a redirect status code.
-        """
-        if self.status in self.REDIRECT_STATUSES:
-            return self.headers.get("location")
-
-        return False
-
-    def release_conn(self):
-        if not self._pool or not self._connection:
-            return
-
-        self._pool._put_conn(self._connection)
-        self._connection = None
-
-    def drain_conn(self):
-        """
-        Read and discard any remaining HTTP response data in the response connection.
-
-        Unread data in the HTTPResponse connection blocks the connection from being released back to the pool.
-        """
-        try:
-            self.read()
-        except (HTTPError, SocketError, BaseSSLError, HTTPException):
-            pass
-
-    @property
-    def data(self):
-        # For backwards-compat with earlier urllib3 0.4 and earlier.
-        if self._body:
-            return self._body
-
-        if self._fp:
-            return self.read(cache_content=True)
-
-    @property
-    def connection(self):
-        return self._connection
-
-    def isclosed(self):
-        return is_fp_closed(self._fp)
-
-    def tell(self):
-        """
-        Obtain the number of bytes pulled over the wire so far. May differ from
-        the amount of content returned by :meth:``urllib3.response.HTTPResponse.read``
-        if bytes are encoded on the wire (e.g, compressed).
-        """
-        return self._fp_bytes_read
-
-    def _init_length(self, request_method):
-        """
-        Set initial length value for Response content if available.
-        """
-        length = self.headers.get("content-length")
-
-        if length is not None:
-            if self.chunked:
-                # This Response will fail with an IncompleteRead if it can't be
-                # received as chunked. This method falls back to attempt reading
-                # the response before raising an exception.
-                log.warning(
-                    "Received response with both Content-Length and "
-                    "Transfer-Encoding set. This is expressly forbidden "
-                    "by RFC 7230 sec 3.3.2. Ignoring Content-Length and "
-                    "attempting to process response as Transfer-Encoding: "
-                    "chunked."
-                )
-                return None
-
-            try:
-                # RFC 7230 section 3.3.2 specifies multiple content lengths can
-                # be sent in a single Content-Length header
-                # (e.g. Content-Length: 42, 42). This line ensures the values
-                # are all valid ints and that as long as the `set` length is 1,
-                # all values are the same. Otherwise, the header is invalid.
-                lengths = set([int(val) for val in length.split(",")])
-                if len(lengths) > 1:
-                    raise InvalidHeader(
-                        "Content-Length contained multiple "
-                        "unmatching values (%s)" % length
-                    )
-                length = lengths.pop()
-            except ValueError:
-                length = None
-            else:
-                if length < 0:
-                    length = None
-
-        # Convert status to int for comparison
-        # In some cases, httplib returns a status of "_UNKNOWN"
-        try:
-            status = int(self.status)
-        except ValueError:
-            status = 0
-
-        # Check for responses that shouldn't include a body
-        if status in (204, 304) or 100 <= status < 200 or request_method == "HEAD":
-            length = 0
-
-        return length
-
-    def _init_decoder(self):
-        """
-        Set-up the _decoder attribute if necessary.
-        """
-        # Note: content-encoding value should be case-insensitive, per RFC 7230
-        # Section 3.2
-        content_encoding = self.headers.get("content-encoding", "").lower()
-        if self._decoder is None:
-            if content_encoding in self.CONTENT_DECODERS:
-                self._decoder = _get_decoder(content_encoding)
-            elif "," in content_encoding:
-                encodings = [
-                    e.strip()
-                    for e in content_encoding.split(",")
-                    if e.strip() in self.CONTENT_DECODERS
-                ]
-                if len(encodings):
-                    self._decoder = _get_decoder(content_encoding)
-
-    DECODER_ERROR_CLASSES = (IOError, zlib.error)
-    if brotli is not None:
-        DECODER_ERROR_CLASSES += (brotli.error,)
-
-    def _decode(self, data, decode_content, flush_decoder):
-        """
-        Decode the data passed in and potentially flush the decoder.
-        """
-        if not decode_content:
-            return data
-
-        try:
-            if self._decoder:
-                data = self._decoder.decompress(data)
-        except self.DECODER_ERROR_CLASSES as e:
-            content_encoding = self.headers.get("content-encoding", "").lower()
-            raise DecodeError(
-                "Received response with content-encoding: %s, but "
-                "failed to decode it." % content_encoding,
-                e,
-            )
-        if flush_decoder:
-            data += self._flush_decoder()
-
-        return data
-
-    def _flush_decoder(self):
-        """
-        Flushes the decoder. Should only be called if the decoder is actually
-        being used.
-        """
-        if self._decoder:
-            buf = self._decoder.decompress(b"")
-            return buf + self._decoder.flush()
-
-        return b""
-
-    @contextmanager
-    def _error_catcher(self):
-        """
-        Catch low-level python exceptions, instead re-raising urllib3
-        variants, so that low-level exceptions are not leaked in the
-        high-level api.
-
-        On exit, release the connection back to the pool.
-        """
-        clean_exit = False
-
-        try:
-            try:
-                yield
-
-            except SocketTimeout:
-                # FIXME: Ideally we'd like to include the url in the ReadTimeoutError but
-                # there is yet no clean way to get at it from this context.
-                raise ReadTimeoutError(self._pool, None, "Read timed out.")
-
-            except BaseSSLError as e:
-                # FIXME: Is there a better way to differentiate between SSLErrors?
-                if "read operation timed out" not in str(e):
-                    # SSL errors related to framing/MAC get wrapped and reraised here
-                    raise SSLError(e)
-
-                raise ReadTimeoutError(self._pool, None, "Read timed out.")
-
-            except (HTTPException, SocketError) as e:
-                # This includes IncompleteRead.
-                raise ProtocolError("Connection broken: %r" % e, e)
-
-            # If no exception is thrown, we should avoid cleaning up
-            # unnecessarily.
-            clean_exit = True
-        finally:
-            # If we didn't terminate cleanly, we need to throw away our
-            # connection.
-            if not clean_exit:
-                # The response may not be closed but we're not going to use it
-                # anymore so close it now to ensure that the connection is
-                # released back to the pool.
-                if self._original_response:
-                    self._original_response.close()
-
-                # Closing the response may not actually be sufficient to close
-                # everything, so if we have a hold of the connection close that
-                # too.
-                if self._connection:
-                    self._connection.close()
-
-            # If we hold the original response but it's closed now, we should
-            # return the connection back to the pool.
-            if self._original_response and self._original_response.isclosed():
-                self.release_conn()
-
-    def _fp_read(self, amt):
-        """
-        Read a response with the thought that reading the number of bytes
-        larger than can fit in a 32-bit int at a time via SSL in some
-        known cases leads to an overflow error that has to be prevented
-        if `amt` or `self.length_remaining` indicate that a problem may
-        happen.
-
-        The known cases:
-          * 3.8 <= CPython < 3.9.7 because of a bug
-            https://github.com/urllib3/urllib3/issues/2513#issuecomment-1152559900.
-          * urllib3 injected with pyOpenSSL-backed SSL-support.
-          * CPython < 3.10 only when `amt` does not fit 32-bit int.
-        """
-        assert self._fp
-        c_int_max = 2 ** 31 - 1
-        if (
-            (
-                (amt and amt > c_int_max)
-                or (self.length_remaining and self.length_remaining > c_int_max)
-            )
-            and not util.IS_SECURETRANSPORT
-            and (util.IS_PYOPENSSL or sys.version_info < (3, 10))
-        ):
-            buffer = io.BytesIO()
-            # Besides `max_chunk_amt` being a maximum chunk size, it
-            # affects memory overhead of reading a response by this
-            # method in CPython.
-            # `c_int_max` equal to 2 GiB - 1 byte is the actual maximum
-            # chunk size that does not lead to an overflow error, but
-            # 256 MiB is a compromise.
-            max_chunk_amt = 2 ** 28
-            while amt is None or amt != 0:
-                if amt is not None:
-                    chunk_amt = min(amt, max_chunk_amt)
-                    amt -= chunk_amt
-                else:
-                    chunk_amt = max_chunk_amt
-                data = self._fp.read(chunk_amt)
-                if not data:
-                    break
-                buffer.write(data)
-                del data  # to reduce peak memory usage by `max_chunk_amt`.
-            return buffer.getvalue()
+    def __repr__(self) -> str:
+        if self.is_sequence:
+            body_info = f"{sum(map(len, self.iter_encoded()))} bytes"
         else:
-            # StringIO doesn't like amt=None
-            return self._fp.read(amt) if amt is not None else self._fp.read()
-
-    def read(self, amt=None, decode_content=None, cache_content=False):
-        """
-        Similar to :meth:`http.client.HTTPResponse.read`, but with two additional
-        parameters: ``decode_content`` and ``cache_content``.
-
-        :param amt:
-            How much of the content to read. If specified, caching is skipped
-            because it doesn't make sense to cache partial content as the full
-            response.
-
-        :param decode_content:
-            If True, will attempt to decode the body based on the
-            'content-encoding' header.
-
-        :param cache_content:
-            If True, will save the returned data such that the same result is
-            returned despite of the state of the underlying file object. This
-            is useful if you want the ``.data`` property to continue working
-            after having ``.read()`` the file object. (Overridden if ``amt`` is
-            set.)
-        """
-        self._init_decoder()
-        if decode_content is None:
-            decode_content = self.decode_content
-
-        if self._fp is None:
-            return
-
-        flush_decoder = False
-        fp_closed = getattr(self._fp, "closed", False)
-
-        with self._error_catcher():
-            data = self._fp_read(amt) if not fp_closed else b""
-            if amt is None:
-                flush_decoder = True
-            else:
-                cache_content = False
-                if (
-                    amt != 0 and not data
-                ):  # Platform-specific: Buggy versions of Python.
-                    # Close the connection when no data is returned
-                    #
-                    # This is redundant to what httplib/http.client _should_
-                    # already do.  However, versions of python released before
-                    # December 15, 2012 (http://bugs.python.org/issue16298) do
-                    # not properly close the connection in all cases. There is
-                    # no harm in redundantly calling close.
-                    self._fp.close()
-                    flush_decoder = True
-                    if self.enforce_content_length and self.length_remaining not in (
-                        0,
-                        None,
-                    ):
-                        # This is an edge case that httplib failed to cover due
-                        # to concerns of backward compatibility. We're
-                        # addressing it here to make sure IncompleteRead is
-                        # raised during streaming, so all calls with incorrect
-                        # Content-Length are caught.
-                        raise IncompleteRead(self._fp_bytes_read, self.length_remaining)
-
-        if data:
-            self._fp_bytes_read += len(data)
-            if self.length_remaining is not None:
-                self.length_remaining -= len(data)
-
-            data = self._decode(data, decode_content, flush_decoder)
-
-            if cache_content:
-                self._body = data
-
-        return data
-
-    def stream(self, amt=2 ** 16, decode_content=None):
-        """
-        A generator wrapper for the read() method. A call will block until
-        ``amt`` bytes have been read from the connection or until the
-        connection is closed.
-
-        :param amt:
-            How much of the content to read. The generator will return up to
-            much data per iteration, but may return less. This is particularly
-            likely when using compressed data. However, the empty string will
-            never be returned.
-
-        :param decode_content:
-            If True, will attempt to decode the body based on the
-            'content-encoding' header.
-        """
-        if self.chunked and self.supports_chunked_reads():
-            for line in self.read_chunked(amt, decode_content=decode_content):
-                yield line
-        else:
-            while not is_fp_closed(self._fp):
-                data = self.read(amt=amt, decode_content=decode_content)
-
-                if data:
-                    yield data
+            body_info = "streamed" if self.is_streamed else "likely-streamed"
+        return f"<{type(self).__name__} {body_info} [{self.status}]>"
 
     @classmethod
-    def from_httplib(ResponseCls, r, **response_kw):
+    def force_type(
+        cls, response: Response, environ: WSGIEnvironment | None = None
+    ) -> Response:
+        """Enforce that the WSGI response is a response object of the current
+        type.  Werkzeug will use the :class:`Response` internally in many
+        situations like the exceptions.  If you call :meth:`get_response` on an
+        exception you will get back a regular :class:`Response` object, even
+        if you are using a custom subclass.
+
+        This method can enforce a given response type, and it will also
+        convert arbitrary WSGI callables into response objects if an environ
+        is provided::
+
+            # convert a Werkzeug response object into an instance of the
+            # MyResponseClass subclass.
+            response = MyResponseClass.force_type(response)
+
+            # convert any WSGI application into a response object
+            response = MyResponseClass.force_type(response, environ)
+
+        This is especially useful if you want to post-process responses in
+        the main dispatcher and use functionality provided by your subclass.
+
+        Keep in mind that this will modify response objects in place if
+        possible!
+
+        :param response: a response object or wsgi application.
+        :param environ: a WSGI environment object.
+        :return: a response object.
         """
-        Given an :class:`http.client.HTTPResponse` instance ``r``, return a
-        corresponding :class:`urllib3.response.HTTPResponse` object.
+        if not isinstance(response, Response):
+            if environ is None:
+                raise TypeError(
+                    "cannot convert WSGI application into response"
+                    " objects without an environ"
+                )
 
-        Remaining parameters are passed to the HTTPResponse constructor, along
-        with ``original_response=r``.
+            from ..test import run_wsgi_app
+
+            response = Response(*run_wsgi_app(response, environ))
+
+        response.__class__ = cls
+        return response
+
+    @classmethod
+    def from_app(
+        cls, app: WSGIApplication, environ: WSGIEnvironment, buffered: bool = False
+    ) -> Response:
+        """Create a new response object from an application output.  This
+        works best if you pass it an application that returns a generator all
+        the time.  Sometimes applications may use the `write()` callable
+        returned by the `start_response` function.  This tries to resolve such
+        edge cases automatically.  But if you don't get the expected output
+        you should set `buffered` to `True` which enforces buffering.
+
+        :param app: the WSGI application to execute.
+        :param environ: the WSGI environment to execute against.
+        :param buffered: set to `True` to enforce buffering.
+        :return: a response object.
         """
-        headers = r.msg
+        from ..test import run_wsgi_app
 
-        if not isinstance(headers, HTTPHeaderDict):
-            if six.PY2:
-                # Python 2.7
-                headers = HTTPHeaderDict.from_httplib(headers)
-            else:
-                headers = HTTPHeaderDict(headers.items())
+        return cls(*run_wsgi_app(app, environ, buffered))
 
-        # HTTPResponse objects in Python 3 don't have a .strict attribute
-        strict = getattr(r, "strict", 0)
-        resp = ResponseCls(
-            body=r,
-            headers=headers,
-            status=r.status,
-            version=r.version,
-            reason=r.reason,
-            strict=strict,
-            original_response=r,
-            **response_kw
-        )
-        return resp
+    @t.overload
+    def get_data(self, as_text: t.Literal[False] = False) -> bytes:
+        ...
 
-    # Backwards-compatibility methods for http.client.HTTPResponse
-    def getheaders(self):
-        warnings.warn(
-            "HTTPResponse.getheaders() is deprecated and will be removed "
-            "in urllib3 v2.1.0. Instead access HTTPResponse.headers directly.",
-            category=DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.headers
+    @t.overload
+    def get_data(self, as_text: t.Literal[True]) -> str:
+        ...
 
-    def getheader(self, name, default=None):
-        warnings.warn(
-            "HTTPResponse.getheader() is deprecated and will be removed "
-            "in urllib3 v2.1.0. Instead use HTTPResponse.headers.get(name, default).",
-            category=DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.headers.get(name, default)
+    def get_data(self, as_text: bool = False) -> bytes | str:
+        """The string representation of the response body.  Whenever you call
+        this property the response iterable is encoded and flattened.  This
+        can lead to unwanted behavior if you stream big data.
 
-    # Backwards compatibility for http.cookiejar
-    def info(self):
-        return self.headers
+        This behavior can be disabled by setting
+        :attr:`implicit_sequence_conversion` to `False`.
 
-    # Overrides from io.IOBase
-    def close(self):
-        if not self.closed:
-            self._fp.close()
+        If `as_text` is set to `True` the return value will be a decoded
+        string.
 
-        if self._connection:
-            self._connection.close()
+        .. versionadded:: 0.9
+        """
+        self._ensure_sequence()
+        rv = b"".join(self.iter_encoded())
 
-        if not self.auto_close:
-            io.IOBase.close(self)
+        if as_text:
+            return rv.decode(self._charset)
+
+        return rv
+
+    def set_data(self, value: bytes | str) -> None:
+        """Sets a new string as response.  The value must be a string or
+        bytes. If a string is set it's encoded to the charset of the
+        response (utf-8 by default).
+
+        .. versionadded:: 0.9
+        """
+        if isinstance(value, str):
+            value = value.encode(self._charset)
+        self.response = [value]
+        if self.automatically_set_content_length:
+            self.headers["Content-Length"] = str(len(value))
+
+    data = property(
+        get_data,
+        set_data,
+        doc="A descriptor that calls :meth:`get_data` and :meth:`set_data`.",
+    )
+
+    def calculate_content_length(self) -> int | None:
+        """Returns the content length if available or `None` otherwise."""
+        try:
+            self._ensure_sequence()
+        except RuntimeError:
+            return None
+        return sum(len(x) for x in self.iter_encoded())
+
+    def _ensure_sequence(self, mutable: bool = False) -> None:
+        """This method can be called by methods that need a sequence.  If
+        `mutable` is true, it will also ensure that the response sequence
+        is a standard Python list.
+
+        .. versionadded:: 0.6
+        """
+        if self.is_sequence:
+            # if we need a mutable object, we ensure it's a list.
+            if mutable and not isinstance(self.response, list):
+                self.response = list(self.response)  # type: ignore
+            return
+        if self.direct_passthrough:
+            raise RuntimeError(
+                "Attempted implicit sequence conversion but the"
+                " response object is in direct passthrough mode."
+            )
+        if not self.implicit_sequence_conversion:
+            raise RuntimeError(
+                "The response object required the iterable to be a"
+                " sequence, but the implicit conversion was disabled."
+                " Call make_sequence() yourself."
+            )
+        self.make_sequence()
+
+    def make_sequence(self) -> None:
+        """Converts the response iterator in a list.  By default this happens
+        automatically if required.  If `implicit_sequence_conversion` is
+        disabled, this method is not automatically called and some properties
+        might raise exceptions.  This also encodes all the items.
+
+        .. versionadded:: 0.6
+        """
+        if not self.is_sequence:
+            # if we consume an iterable we have to ensure that the close
+            # method of the iterable is called if available when we tear
+            # down the response
+            close = getattr(self.response, "close", None)
+            self.response = list(self.iter_encoded())
+            if close is not None:
+                self.call_on_close(close)
+
+    def iter_encoded(self) -> t.Iterator[bytes]:
+        """Iter the response encoded with the encoding of the response.
+        If the response object is invoked as WSGI application the return
+        value of this method is used as application iterator unless
+        :attr:`direct_passthrough` was activated.
+        """
+        # Encode in a separate function so that self.response is fetched
+        # early.  This allows us to wrap the response with the return
+        # value from get_app_iter or iter_encoded.
+        return _iter_encoded(self.response, self._charset)
 
     @property
-    def closed(self):
-        if not self.auto_close:
-            return io.IOBase.closed.__get__(self)
-        elif self._fp is None:
-            return True
-        elif hasattr(self._fp, "isclosed"):
-            return self._fp.isclosed()
-        elif hasattr(self._fp, "closed"):
-            return self._fp.closed
-        else:
-            return True
+    def is_streamed(self) -> bool:
+        """If the response is streamed (the response is not an iterable with
+        a length information) this property is `True`.  In this case streamed
+        means that there is no information about the number of iterations.
+        This is usually `True` if a generator is passed to the response object.
 
-    def fileno(self):
-        if self._fp is None:
-            raise IOError("HTTPResponse has no file to get a fileno from")
-        elif hasattr(self._fp, "fileno"):
-            return self._fp.fileno()
-        else:
-            raise IOError(
-                "The file-like object this HTTPResponse is wrapped "
-                "around has no file descriptor"
-            )
+        This is useful for checking before applying some sort of post
+        filtering that should not take place for streamed responses.
+        """
+        try:
+            len(self.response)  # type: ignore
+        except (TypeError, AttributeError):
+            return True
+        return False
 
-    def flush(self):
+    @property
+    def is_sequence(self) -> bool:
+        """If the iterator is buffered, this property will be `True`.  A
+        response object will consider an iterator to be buffered if the
+        response attribute is a list or tuple.
+
+        .. versionadded:: 0.6
+        """
+        return isinstance(self.response, (tuple, list))
+
+    def close(self) -> None:
+        """Close the wrapped response if possible.  You can also use the object
+        in a with statement which will automatically close it.
+
+        .. versionadded:: 0.9
+           Can now be used in a with statement.
+        """
+        if hasattr(self.response, "close"):
+            self.response.close()
+        for func in self._on_close:
+            func()
+
+    def __enter__(self) -> Response:
+        return self
+
+    def __exit__(self, exc_type, exc_value, tb):  # type: ignore
+        self.close()
+
+    def freeze(self) -> None:
+        """Make the response object ready to be pickled. Does the
+        following:
+
+        *   Buffer the response into a list, ignoring
+            :attr:`implicity_sequence_conversion` and
+            :attr:`direct_passthrough`.
+        *   Set the ``Content-Length`` header.
+        *   Generate an ``ETag`` header if one is not already set.
+
+        .. versionchanged:: 2.1
+            Removed the ``no_etag`` parameter.
+
+        .. versionchanged:: 2.0
+            An ``ETag`` header is always added.
+
+        .. versionchanged:: 0.6
+            The ``Content-Length`` header is set.
+        """
+        # Always freeze the encoded response body, ignore
+        # implicit_sequence_conversion and direct_passthrough.
+        self.response = list(self.iter_encoded())
+        self.headers["Content-Length"] = str(sum(map(len, self.response)))
+        self.add_etag()
+
+    def get_wsgi_headers(self, environ: WSGIEnvironment) -> Headers:
+        """This is automatically called right before the response is started
+        and returns headers modified for the given environment.  It returns a
+        copy of the headers from the response with some modifications applied
+        if necessary.
+
+        For example the location header (if present) is joined with the root
+        URL of the environment.  Also the content length is automatically set
+        to zero here for certain status codes.
+
+        .. versionchanged:: 0.6
+           Previously that function was called `fix_headers` and modified
+           the response object in place.  Also since 0.6, IRIs in location
+           and content-location headers are handled properly.
+
+           Also starting with 0.6, Werkzeug will attempt to set the content
+           length if it is able to figure it out on its own.  This is the
+           case if all the strings in the response iterable are already
+           encoded and the iterable is buffered.
+
+        :param environ: the WSGI environment of the request.
+        :return: returns a new :class:`~werkzeug.datastructures.Headers`
+                 object.
+        """
+        headers = Headers(self.headers)
+        location: str | None = None
+        content_location: str | None = None
+        content_length: str | int | None = None
+        status = self.status_code
+
+        # iterate over the headers to find all values in one go.  Because
+        # get_wsgi_headers is used each response that gives us a tiny
+        # speedup.
+        for key, value in headers:
+            ikey = key.lower()
+            if ikey == "location":
+                location = value
+            elif ikey == "content-location":
+                content_location = value
+            elif ikey == "content-length":
+                content_length = value
+
+        if location is not None:
+            location = _invalid_iri_to_uri(location)
+
+            if self.autocorrect_location_header:
+                # Make the location header an absolute URL.
+                current_url = get_current_url(environ, strip_querystring=True)
+                current_url = iri_to_uri(current_url)
+                location = urljoin(current_url, location)
+
+            headers["Location"] = location
+
+        # make sure the content location is a URL
+        if content_location is not None:
+            headers["Content-Location"] = iri_to_uri(content_location)
+
+        if 100 <= status < 200 or status == 204:
+            # Per section 3.3.2 of RFC 7230, "a server MUST NOT send a
+            # Content-Length header field in any response with a status
+            # code of 1xx (Informational) or 204 (No Content)."
+            headers.remove("Content-Length")
+        elif status == 304:
+            remove_entity_headers(headers)
+
+        # if we can determine the content length automatically, we
+        # should try to do that.  But only if this does not involve
+        # flattening the iterator or encoding of strings in the
+        # response. We however should not do that if we have a 304
+        # response.
         if (
-            self._fp is not None
-            and hasattr(self._fp, "flush")
-            and not getattr(self._fp, "closed", False)
+            self.automatically_set_content_length
+            and self.is_sequence
+            and content_length is None
+            and status not in (204, 304)
+            and not (100 <= status < 200)
         ):
-            return self._fp.flush()
+            content_length = sum(len(x) for x in self.iter_encoded())
+            headers["Content-Length"] = str(content_length)
 
-    def readable(self):
-        # This method is required for `io` module compatibility.
+        return headers
+
+    def get_app_iter(self, environ: WSGIEnvironment) -> t.Iterable[bytes]:
+        """Returns the application iterator for the given environ.  Depending
+        on the request method and the current status code the return value
+        might be an empty response rather than the one from the response.
+
+        If the request method is `HEAD` or the status code is in a range
+        where the HTTP specification requires an empty response, an empty
+        iterable is returned.
+
+        .. versionadded:: 0.6
+
+        :param environ: the WSGI environment of the request.
+        :return: a response iterable.
+        """
+        status = self.status_code
+        if (
+            environ["REQUEST_METHOD"] == "HEAD"
+            or 100 <= status < 200
+            or status in (204, 304)
+        ):
+            iterable: t.Iterable[bytes] = ()
+        elif self.direct_passthrough:
+            return self.response  # type: ignore
+        else:
+            iterable = self.iter_encoded()
+        return ClosingIterator(iterable, self.close)
+
+    def get_wsgi_response(
+        self, environ: WSGIEnvironment
+    ) -> tuple[t.Iterable[bytes], str, list[tuple[str, str]]]:
+        """Returns the final WSGI response as tuple.  The first item in
+        the tuple is the application iterator, the second the status and
+        the third the list of headers.  The response returned is created
+        specially for the given environment.  For example if the request
+        method in the WSGI environment is ``'HEAD'`` the response will
+        be empty and only the headers and status code will be present.
+
+        .. versionadded:: 0.6
+
+        :param environ: the WSGI environment of the request.
+        :return: an ``(app_iter, status, headers)`` tuple.
+        """
+        headers = self.get_wsgi_headers(environ)
+        app_iter = self.get_app_iter(environ)
+        return app_iter, self.status, headers.to_wsgi_list()
+
+    def __call__(
+        self, environ: WSGIEnvironment, start_response: StartResponse
+    ) -> t.Iterable[bytes]:
+        """Process this response as WSGI application.
+
+        :param environ: the WSGI environment.
+        :param start_response: the response callable provided by the WSGI
+                               server.
+        :return: an application iterator
+        """
+        app_iter, status, headers = self.get_wsgi_response(environ)
+        start_response(status, headers)
+        return app_iter
+
+    # JSON
+
+    #: A module or other object that has ``dumps`` and ``loads``
+    #: functions that match the API of the built-in :mod:`json` module.
+    json_module = json
+
+    @property
+    def json(self) -> t.Any | None:
+        """The parsed JSON data if :attr:`mimetype` indicates JSON
+        (:mimetype:`application/json`, see :attr:`is_json`).
+
+        Calls :meth:`get_json` with default arguments.
+        """
+        return self.get_json()
+
+    @t.overload
+    def get_json(self, force: bool = ..., silent: t.Literal[False] = ...) -> t.Any:
+        ...
+
+    @t.overload
+    def get_json(self, force: bool = ..., silent: bool = ...) -> t.Any | None:
+        ...
+
+    def get_json(self, force: bool = False, silent: bool = False) -> t.Any | None:
+        """Parse :attr:`data` as JSON. Useful during testing.
+
+        If the mimetype does not indicate JSON
+        (:mimetype:`application/json`, see :attr:`is_json`), this
+        returns ``None``.
+
+        Unlike :meth:`Request.get_json`, the result is not cached.
+
+        :param force: Ignore the mimetype and always try to parse JSON.
+        :param silent: Silence parsing errors and return ``None``
+            instead.
+        """
+        if not (force or self.is_json):
+            return None
+
+        data = self.get_data()
+
+        try:
+            return self.json_module.loads(data)
+        except ValueError:
+            if not silent:
+                raise
+
+            return None
+
+    # Stream
+
+    @cached_property
+    def stream(self) -> ResponseStream:
+        """The response iterable as write-only stream."""
+        return ResponseStream(self)
+
+    def _wrap_range_response(self, start: int, length: int) -> None:
+        """Wrap existing Response in case of Range Request context."""
+        if self.status_code == 206:
+            self.response = _RangeWrapper(self.response, start, length)  # type: ignore
+
+    def _is_range_request_processable(self, environ: WSGIEnvironment) -> bool:
+        """Return ``True`` if `Range` header is present and if underlying
+        resource is considered unchanged when compared with `If-Range` header.
+        """
+        return (
+            "HTTP_IF_RANGE" not in environ
+            or not is_resource_modified(
+                environ,
+                self.headers.get("etag"),
+                None,
+                self.headers.get("last-modified"),
+                ignore_if_range=False,
+            )
+        ) and "HTTP_RANGE" in environ
+
+    def _process_range_request(
+        self,
+        environ: WSGIEnvironment,
+        complete_length: int | None,
+        accept_ranges: bool | str,
+    ) -> bool:
+        """Handle Range Request related headers (RFC7233).  If `Accept-Ranges`
+        header is valid, and Range Request is processable, we set the headers
+        as described by the RFC, and wrap the underlying response in a
+        RangeWrapper.
+
+        Returns ``True`` if Range Request can be fulfilled, ``False`` otherwise.
+
+        :raises: :class:`~werkzeug.exceptions.RequestedRangeNotSatisfiable`
+                 if `Range` header could not be parsed or satisfied.
+
+        .. versionchanged:: 2.0
+            Returns ``False`` if the length is 0.
+        """
+        from ..exceptions import RequestedRangeNotSatisfiable
+
+        if (
+            not accept_ranges
+            or complete_length is None
+            or complete_length == 0
+            or not self._is_range_request_processable(environ)
+        ):
+            return False
+
+        if accept_ranges is True:
+            accept_ranges = "bytes"
+
+        parsed_range = parse_range_header(environ.get("HTTP_RANGE"))
+
+        if parsed_range is None:
+            raise RequestedRangeNotSatisfiable(complete_length)
+
+        range_tuple = parsed_range.range_for_length(complete_length)
+        content_range_header = parsed_range.to_content_range_header(complete_length)
+
+        if range_tuple is None or content_range_header is None:
+            raise RequestedRangeNotSatisfiable(complete_length)
+
+        content_length = range_tuple[1] - range_tuple[0]
+        self.headers["Content-Length"] = str(content_length)
+        self.headers["Accept-Ranges"] = accept_ranges
+        self.content_range = content_range_header  # type: ignore
+        self.status_code = 206
+        self._wrap_range_response(range_tuple[0], content_length)
         return True
 
-    def readinto(self, b):
-        # This method is required for `io` module compatibility.
-        temp = self.read(len(b))
-        if len(temp) == 0:
-            return 0
-        else:
-            b[: len(temp)] = temp
-            return len(temp)
+    def make_conditional(
+        self,
+        request_or_environ: WSGIEnvironment | Request,
+        accept_ranges: bool | str = False,
+        complete_length: int | None = None,
+    ) -> Response:
+        """Make the response conditional to the request.  This method works
+        best if an etag was defined for the response already.  The `add_etag`
+        method can be used to do that.  If called without etag just the date
+        header is set.
 
-    def supports_chunked_reads(self):
+        This does nothing if the request method in the request or environ is
+        anything but GET or HEAD.
+
+        For optimal performance when handling range requests, it's recommended
+        that your response data object implements `seekable`, `seek` and `tell`
+        methods as described by :py:class:`io.IOBase`.  Objects returned by
+        :meth:`~werkzeug.wsgi.wrap_file` automatically implement those methods.
+
+        It does not remove the body of the response because that's something
+        the :meth:`__call__` function does for us automatically.
+
+        Returns self so that you can do ``return resp.make_conditional(req)``
+        but modifies the object in-place.
+
+        :param request_or_environ: a request object or WSGI environment to be
+                                   used to make the response conditional
+                                   against.
+        :param accept_ranges: This parameter dictates the value of
+                              `Accept-Ranges` header. If ``False`` (default),
+                              the header is not set. If ``True``, it will be set
+                              to ``"bytes"``. If it's a string, it will use this
+                              value.
+        :param complete_length: Will be used only in valid Range Requests.
+                                It will set `Content-Range` complete length
+                                value and compute `Content-Length` real value.
+                                This parameter is mandatory for successful
+                                Range Requests completion.
+        :raises: :class:`~werkzeug.exceptions.RequestedRangeNotSatisfiable`
+                 if `Range` header could not be parsed or satisfied.
+
+        .. versionchanged:: 2.0
+            Range processing is skipped if length is 0 instead of
+            raising a 416 Range Not Satisfiable error.
         """
-        Checks if the underlying file-like object looks like a
-        :class:`http.client.HTTPResponse` object. We do this by testing for
-        the fp attribute. If it is present we assume it returns raw chunks as
-        processed by read_chunked().
-        """
-        return hasattr(self._fp, "fp")
-
-    def _update_chunk_length(self):
-        # First, we'll figure out length of a chunk and then
-        # we'll try to read it from socket.
-        if self.chunk_left is not None:
-            return
-        line = self._fp.fp.readline()
-        line = line.split(b";", 1)[0]
-        try:
-            self.chunk_left = int(line, 16)
-        except ValueError:
-            # Invalid chunked protocol response, abort.
-            self.close()
-            raise InvalidChunkLength(self, line)
-
-    def _handle_chunk(self, amt):
-        returned_chunk = None
-        if amt is None:
-            chunk = self._fp._safe_read(self.chunk_left)
-            returned_chunk = chunk
-            self._fp._safe_read(2)  # Toss the CRLF at the end of the chunk.
-            self.chunk_left = None
-        elif amt < self.chunk_left:
-            value = self._fp._safe_read(amt)
-            self.chunk_left = self.chunk_left - amt
-            returned_chunk = value
-        elif amt == self.chunk_left:
-            value = self._fp._safe_read(amt)
-            self._fp._safe_read(2)  # Toss the CRLF at the end of the chunk.
-            self.chunk_left = None
-            returned_chunk = value
-        else:  # amt > self.chunk_left
-            returned_chunk = self._fp._safe_read(self.chunk_left)
-            self._fp._safe_read(2)  # Toss the CRLF at the end of the chunk.
-            self.chunk_left = None
-        return returned_chunk
-
-    def read_chunked(self, amt=None, decode_content=None):
-        """
-        Similar to :meth:`HTTPResponse.read`, but with an additional
-        parameter: ``decode_content``.
-
-        :param amt:
-            How much of the content to read. If specified, caching is skipped
-            because it doesn't make sense to cache partial content as the full
-            response.
-
-        :param decode_content:
-            If True, will attempt to decode the body based on the
-            'content-encoding' header.
-        """
-        self._init_decoder()
-        # FIXME: Rewrite this method and make it a class with a better structured logic.
-        if not self.chunked:
-            raise ResponseNotChunked(
-                "Response is not chunked. "
-                "Header 'transfer-encoding: chunked' is missing."
-            )
-        if not self.supports_chunked_reads():
-            raise BodyNotHttplibCompatible(
-                "Body should be http.client.HTTPResponse like. "
-                "It should have have an fp attribute which returns raw chunks."
-            )
-
-        with self._error_catcher():
-            # Don't bother reading the body of a HEAD request.
-            if self._original_response and is_response_to_head(self._original_response):
-                self._original_response.close()
-                return
-
-            # If a response is already read and closed
-            # then return immediately.
-            if self._fp.fp is None:
-                return
-
-            while True:
-                self._update_chunk_length()
-                if self.chunk_left == 0:
-                    break
-                chunk = self._handle_chunk(amt)
-                decoded = self._decode(
-                    chunk, decode_content=decode_content, flush_decoder=False
-                )
-                if decoded:
-                    yield decoded
-
-            if decode_content:
-                # On CPython and PyPy, we should never need to flush the
-                # decoder. However, on Jython we *might* need to, so
-                # lets defensively do it anyway.
-                decoded = self._flush_decoder()
-                if decoded:  # Platform-specific: Jython.
-                    yield decoded
-
-            # Chunk content ends with \r\n: discard it.
-            while True:
-                line = self._fp.fp.readline()
-                if not line:
-                    # Some sites may not end with '\r\n'.
-                    break
-                if line == b"\r\n":
-                    break
-
-            # We read everything; close the "file".
-            if self._original_response:
-                self._original_response.close()
-
-    def geturl(self):
-        """
-        Returns the URL that was the source of this response.
-        If the request that generated this response redirected, this method
-        will return the final redirect location.
-        """
-        if self.retries is not None and len(self.retries.history):
-            return self.retries.history[-1].redirect_location
-        else:
-            return self._request_url
-
-    def __iter__(self):
-        buffer = []
-        for chunk in self.stream(decode_content=True):
-            if b"\n" in chunk:
-                chunk = chunk.split(b"\n")
-                yield b"".join(buffer) + chunk[0] + b"\n"
-                for x in chunk[1:-1]:
-                    yield x + b"\n"
-                if chunk[-1]:
-                    buffer = [chunk[-1]]
+        environ = _get_environ(request_or_environ)
+        if environ["REQUEST_METHOD"] in ("GET", "HEAD"):
+            # if the date is not in the headers, add it now.  We however
+            # will not override an already existing header.  Unfortunately
+            # this header will be overridden by many WSGI servers including
+            # wsgiref.
+            if "date" not in self.headers:
+                self.headers["Date"] = http_date()
+            is206 = self._process_range_request(environ, complete_length, accept_ranges)
+            if not is206 and not is_resource_modified(
+                environ,
+                self.headers.get("etag"),
+                None,
+                self.headers.get("last-modified"),
+            ):
+                if parse_etags(environ.get("HTTP_IF_MATCH")):
+                    self.status_code = 412
                 else:
-                    buffer = []
-            else:
-                buffer.append(chunk)
-        if buffer:
-            yield b"".join(buffer)
+                    self.status_code = 304
+            if (
+                self.automatically_set_content_length
+                and "content-length" not in self.headers
+            ):
+                length = self.calculate_content_length()
+                if length is not None:
+                    self.headers["Content-Length"] = str(length)
+        return self
+
+    def add_etag(self, overwrite: bool = False, weak: bool = False) -> None:
+        """Add an etag for the current response if there is none yet.
+
+        .. versionchanged:: 2.0
+            SHA-1 is used to generate the value. MD5 may not be
+            available in some environments.
+        """
+        if overwrite or "etag" not in self.headers:
+            self.set_etag(generate_etag(self.get_data()), weak)
+
+
+class ResponseStream:
+    """A file descriptor like object used by :meth:`Response.stream` to
+    represent the body of the stream. It directly pushes into the
+    response iterable of the response object.
+    """
+
+    mode = "wb+"
+
+    def __init__(self, response: Response):
+        self.response = response
+        self.closed = False
+
+    def write(self, value: bytes) -> int:
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
+        self.response._ensure_sequence(mutable=True)
+        self.response.response.append(value)  # type: ignore
+        self.response.headers.pop("Content-Length", None)
+        return len(value)
+
+    def writelines(self, seq: t.Iterable[bytes]) -> None:
+        for item in seq:
+            self.write(item)
+
+    def close(self) -> None:
+        self.closed = True
+
+    def flush(self) -> None:
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
+
+    def isatty(self) -> bool:
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
+        return False
+
+    def tell(self) -> int:
+        self.response._ensure_sequence()
+        return sum(map(len, self.response.response))
+
+    @property
+    def encoding(self) -> str:
+        return self.response._charset
